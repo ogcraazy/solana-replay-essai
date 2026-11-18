@@ -1,0 +1,127 @@
+name: Relevé de l'archive
+
+# Ce que pèse l'archive publique Old Faithful, époque par époque : la taille et la date de
+# chaque fichier, par des requêtes d'en-tête seulement (rien n'est téléchargé), et, pour une
+# plage de slots, le nombre d'octets à lire d'après l'index de son époque. Lancé à la main ;
+# aucun secret ; le résultat est déposé sur la branche « resultats ».
+
+on:
+  workflow_dispatch:
+    inputs:
+      epoques:
+        description: Époques dont relever la taille et la date, « première-dernière » (600 au plus)
+        required: true
+      plage:
+        description: Plage de slots dont compter les octets d'après l'index, « début:fin » (peut rester vide)
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: releve
+  cancel-in-progress: false
+
+env:
+  ARCHIVE: https://files.old-faithful.net
+
+jobs:
+  releve:
+    name: Relever les époques
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Atelier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Rien de ce qui est saisi n'entre dans le texte de ce qui s'exécute.
+      - name: Saisies
+        env:
+          EPOQUES: ${{ inputs.epoques }}
+          PLAGE: ${{ inputs.plage }}
+        run: |
+          refuse() { echo "::error::saisie refusée : $1"; exit 2; }
+          [[ "$EPOQUES" =~ ^[0-9]{1,5}-[0-9]{1,5}$ ]] || refuse "époques, attendu « première-dernière »"
+          premiere=$((10#${EPOQUES%%-*})); derniere=$((10#${EPOQUES##*-}))
+          (( premiere <= derniere && derniere - premiere < 600 )) || refuse "époques à l'envers, ou plus de 600"
+          [[ "$PLAGE" =~ ^([0-9]{1,12}:[0-9]{1,12})?$ ]] || refuse "plage, attendu « début:fin »"
+          debut=""; fin=""
+          if [[ -n "$PLAGE" ]]; then
+            debut=$((10#${PLAGE%%:*})); fin=$((10#${PLAGE##*:}))
+            (( debut <= fin && fin / 432000 - debut / 432000 < 8 )) || refuse "plage à l'envers, ou sur plus de huit époques"
+          fi
+          {
+            echo "PREMIERE=$premiere"
+            echo "DERNIERE=$derniere"
+            echo "PLAGE_DEBUT=$debut"
+            echo "PLAGE_FIN=$fin"
+            echo "RELEVE=$RUNNER_TEMP/releve"
+          } >> "$GITHUB_ENV"
+      - name: Tailles et dates
+        run: |
+          mkdir -p "$RELEVE"
+          echo "epoque,code,octets,date" > "$RELEVE/epoques.csv"
+          for epoque in $(seq "$PREMIERE" "$DERNIERE"); do
+            entetes=$(curl --silent --head --location --max-time 30 "$ARCHIVE/$epoque/epoch-$epoque.car" || true)
+            code=$(awk 'toupper($1) ~ /^HTTP/ { code = $2 } END { print code }' <<< "$entetes")
+            octets=$(awk -F': ' 'tolower($1) == "content-length" { sub(/\r/, "", $2); octets = $2 } END { print octets }' <<< "$entetes")
+            date=$(awk -F': ' 'tolower($1) == "last-modified" { sub(/\r/, "", $2); date = $2 } END { print date }' <<< "$entetes")
+            echo "$epoque,$code,$octets,\"$date\"" >> "$RELEVE/epoques.csv"
+            sleep 0.2
+          done
+          echo "époques relevées : $(( $(wc -l < "$RELEVE/epoques.csv") - 1 ))"
+          awk -F, 'NR > 1 && $2 == 200 { fichiers += 1; octets += $3 } END { printf "fichiers trouvés : %d, %.1f To en tout\n", fichiers, octets / 1e12 }' "$RELEVE/epoques.csv"
+          head -3 "$RELEVE/epoques.csv" && tail -3 "$RELEVE/epoques.csv"
+      - name: Octets de la plage
+        if: env.PLAGE_DEBUT != ''
+        run: |
+          for epoque in $(seq "$((PLAGE_DEBUT / 432000))" "$((PLAGE_FIN / 432000))"); do
+            curl --silent --show-error --fail --location --max-time 120 \
+              --output "$RUNNER_TEMP/index-$epoque.raw" "$ARCHIVE/$epoque/epoch-$epoque-slot-ranges.raw"
+            python3 releve/octets.py "$RUNNER_TEMP/index-$epoque.raw" "$epoque" >> "$RELEVE/plage.jsonl"
+            python3 releve/octets.py "$RUNNER_TEMP/index-$epoque.raw" "$epoque" "$PLAGE_DEBUT" "$PLAGE_FIN" >> "$RELEVE/plage.jsonl"
+          done
+          cat "$RELEVE/plage.jsonl"
+      - name: Pièce jointe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: releve
+          path: ${{ runner.temp }}/releve
+          if-no-files-found: error
+          retention-days: 14
+
+  # Cette tâche seule a le droit d'écrire dans le dépôt, et n'exécute aucun code venu d'ailleurs.
+  rendre:
+    name: Déposer le relevé
+    needs: releve
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Dépôt
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Relevé
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: releve
+          path: ${{ runner.temp }}/releve
+      - name: Branche des résultats
+        env:
+          EXECUTION: ${{ github.run_id }}
+        run: |
+          if git fetch --quiet --depth 1 origin resultats; then
+            git checkout --quiet -B resultats FETCH_HEAD
+          else
+            git checkout --quiet --orphan resultats
+            git rm -r --quiet --force .
+          fi
+          mkdir -p "releves/$EXECUTION"
+          cp "$RUNNER_TEMP"/releve/* "releves/$EXECUTION/"
+          git add releves
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet --message "Relevé de l'exécution $EXECUTION"
+          git push --quiet origin resultats
+          ls -l "releves/$EXECUTION"
