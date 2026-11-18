@@ -168,6 +168,13 @@ jobs:
             awk 'NR > 2 { sub(/^ +/, ""); split($0, champs, /[: ]+/); if (champs[1] != "lo") octets += champs[2] }
               END { printf "%d\n", octets }' /proc/net/dev
           }
+          # Le même compte carte par carte : sur certaines machines, une même réception paraît
+          # sous deux cartes (la carte et sa doublure), et le total la compte alors deux fois.
+          cartes() {
+            awk 'NR > 2 { sub(/^ +/, ""); split($0, champs, /[: ]+/); printf "%s=%s ", champs[1], champs[2] }
+              END { print "" }' /proc/net/dev
+          }
+          echo "cartes avant : $(cartes)"
           avant=$(recu); depart=$SECONDS
           # Passé la durée dite, la lecture est arrêtée comme par Ctrl-C, et l'étape échoue avec
           # le code 124 : les comptes rendus sont alors ceux d'une plage lue en partie.
@@ -175,6 +182,7 @@ jobs:
           timeout --signal=INT --kill-after=120 "${ESSAI_MINUTES}m" \
             /usr/bin/time -v outil/target/release/examples/essai || issue=$?
           echo "relecture : code $issue, $((SECONDS - depart)) s, $(( ($(recu) - avant) / 1000000 )) Mo reçus du réseau"
+          echo "cartes après : $(cartes)"
           exit "$issue"
       - name: Résultats
         if: always()
