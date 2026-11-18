@@ -1,10 +1,12 @@
 name: Essai de relecture
 
-# La recette de l'essai : elle prend l'outil libre Jetstreamer à un commit fixé, y pose le
-# greffon de ce dépôt et un correctif de quatre lignes, compile, relit une plage de slots de
-# l'archive publique Old Faithful et rend ce que le greffon a compté. Elle ne se lance qu'à
-# la main et ne lit aucun secret ; ses résultats, des données publiques de la chaîne, sont
-# déposés sur la branche « resultats » de ce dépôt.
+# La recette de l'atelier : elle prend l'outil libre Jetstreamer à un commit fixé, y pose le
+# greffon de ce dépôt et deux correctifs, compile, relit une plage de slots de l'archive
+# publique Old Faithful et rend le flux des transactions des programmes donnés, au format
+# Yellowstone gRPC, à un programme d'empreintes qui le lit au fil de l'eau : rien du flux
+# n'est gardé, hors les transactions nommées. Elle ne se lance qu'à la main et ne lit aucun
+# secret ; ses résultats, des données publiques de la chaîne, sont déposés sur la branche
+# « resultats » de ce dépôt.
 
 on:
   workflow_dispatch:
@@ -15,9 +17,15 @@ on:
       programmes:
         description: Adresses des programmes à garder, en base 58, séparées par des virgules
         required: true
-      slots_entiers:
-        description: Slots dont les transactions gardées sont écrites en entier, séparés par des virgules (peut rester vide)
+      a_part:
+        description: Transactions dont l'enregistrement est gardé, « slot/rang » séparés par des virgules (peut rester vide)
         default: ""
+      voies:
+        description: Nombre de voies du flux, chacune lue par un programme d'empreintes (1 à 8)
+        default: "3"
+      echantillon:
+        description: Une tranche de slots sur N porte le détail champ par champ
+        default: "16"
       fils:
         description: Nombre de fils de lecture (vide = au choix de l'outil)
         default: ""
@@ -42,6 +50,9 @@ env:
   OUTIL: ce2f3678d78ce4a430f63621301b78d914d76a8a
   ARCHIVE: https://files.old-faithful.net
   OPENSSL_NO_VENDOR: "1"
+  # Limite d'octets sous laquelle un nœud garde les journaux d'une transaction : l'archive
+  # les a entiers, le programme d'empreintes les coupe par la règle du nœud avant de les lire.
+  COUPE: "10000"
 
 jobs:
   essai:
@@ -67,7 +78,9 @@ jobs:
         env:
           PLAGE: ${{ inputs.plage }}
           PROGRAMMES: ${{ inputs.programmes }}
-          SLOTS_ENTIERS: ${{ inputs.slots_entiers }}
+          A_PART: ${{ inputs.a_part }}
+          VOIES: ${{ inputs.voies }}
+          ECHANTILLON: ${{ inputs.echantillon }}
           FILS: ${{ inputs.fils }}
           MINUTES: ${{ inputs.minutes }}
           OPTIMISATION: ${{ inputs.optimisation }}
@@ -78,15 +91,24 @@ jobs:
           (( 10#$debut <= 10#$fin )) || refuse "plage à l'envers"
           [[ "$PROGRAMMES" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}(,[1-9A-HJ-NP-Za-km-z]{32,44}){0,7}$ ]] \
             || refuse "programmes, attendu des adresses en base 58 séparées par des virgules"
-          [[ "$SLOTS_ENTIERS" =~ ^([0-9]{1,12}(,[0-9]{1,12})*)?$ ]] || refuse "slots entiers"
+          [[ "$A_PART" =~ ^([0-9]{1,12}/[0-9]{1,6}(,[0-9]{1,12}/[0-9]{1,6})*)?$ ]] \
+            || refuse "transactions à part, attendu « slot/rang » séparés par des virgules"
+          [[ "$VOIES" =~ ^[1-8]$ ]] || refuse "voies, de 1 à 8"
+          if ! [[ "$ECHANTILLON" =~ ^[0-9]{1,9}$ ]] || (( 10#$ECHANTILLON < 1 )); then
+            refuse "échantillon, un nombre au moins égal à 1"
+          fi
           [[ "$FILS" =~ ^[0-9]{0,3}$ ]] || refuse "fils"
-          [[ "$MINUTES" =~ ^[0-9]{1,3}$ ]] && (( 10#$MINUTES >= 1 && 10#$MINUTES <= 300 )) \
-            || refuse "minutes, de 1 à 300"
+          if ! [[ "$MINUTES" =~ ^[0-9]{1,3}$ ]] || (( 10#$MINUTES < 1 || 10#$MINUTES > 300 )); then
+            refuse "minutes, de 1 à 300"
+          fi
           [[ "$OPTIMISATION" == rapide || "$OPTIMISATION" == complete ]] || refuse "optimisation"
           {
             echo "ESSAI_PLAGE=$((10#$debut)):$((10#$fin))"
             echo "ESSAI_PROGRAMMES=$PROGRAMMES"
-            echo "ESSAI_SLOTS_ENTIERS=$SLOTS_ENTIERS"
+            echo "ESSAI_A_PART=$A_PART"
+            echo "ESSAI_NOMBRE_DE_VOIES=$VOIES"
+            echo "ESSAI_ECHANTILLON=$((10#$ECHANTILLON))"
+            echo "ESSAI_TRANCHE=100"
             echo "ESSAI_FILS=$FILS"
             echo "ESSAI_MINUTES=$((10#$MINUTES))"
             echo "ESSAI_OPTIMISATION=$OPTIMISATION"
@@ -109,20 +131,45 @@ jobs:
                 | grep -i -E '^(HTTP/|content-length:|last-modified:)' || echo "pas de réponse"
             done
           done
+      - name: Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      # Le programme d'empreintes et les définitions du flux sont contrôlés par leurs
+      # empreintes ; les bibliothèques, par les leurs ; le module des définitions est produit
+      # ici, à chaque exécution.
+      - name: Programme d'empreintes et définitions du flux
+        run: |
+          (cd empreintes && sha256sum --check EMPREINTES.sha256)
+          python -m pip install --quiet --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r empreintes/dependances.txt
+          modeles=$(python -c 'import grpc_tools, pathlib; print(pathlib.Path(grpc_tools.__file__).parent / "_proto")')
+          mkdir -p "$RUNNER_TEMP/definitions"
+          for definition in solana-storage.proto geyser.proto; do
+            python -m grpc_tools.protoc -Iempreintes/definitions "-I$modeles" \
+              "--python_out=$RUNNER_TEMP/definitions" "$definition"
+          done
+          ls -l "$RUNNER_TEMP/definitions"
+          python --version
+          python -c 'import google.protobuf; print("protobuf", google.protobuf.__version__)'
       - name: Dépendances de compilation
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev time zstd
           clang --version | head -1
-      # Le correctif : depuis l'époque 1064, le premier bloc de chaque époque porte des
-      # récompenses d'un type que cette version de l'outil refuse, et la lecture n'en sort pas
-      # (constaté à l'exécution n° 44329878008). Le greffon ne lit aucune récompense : le
-      # correctif les fait passer sans les lire, et ne touche à rien d'autre.
+      # Deux correctifs, et rien d'autre. Le premier : depuis l'époque 1064, le premier bloc
+      # de chaque époque porte des récompenses d'un type que cette version de l'outil refuse,
+      # et la lecture n'en sort pas (constaté à l'exécution n° 44329878008) ; le greffon ne lit
+      # aucune récompense, le correctif les fait passer sans les lire. Le second : l'outil rend
+      # au greffon, en plus du compte rendu d'exécution qu'il a décodé, les octets de ce compte
+      # rendu tels que l'archive les garde, et la transaction signée au format du flux par la
+      # conversion de la bibliothèque de Solana ; il ne change rien à ce que l'outil lit.
       - name: Greffon posé dans l'outil
         run: |
           git -C outil apply --verbose "$GITHUB_WORKSPACE/greffon/recompenses.patch"
+          git -C outil apply --verbose "$GITHUB_WORKSPACE/greffon/octets.patch"
           mkdir -p outil/examples/essai
-          cp greffon/main.rs greffon/outils.rs outil/examples/essai/
+          cp greffon/main.rs greffon/flux.rs greffon/outils.rs outil/examples/essai/
       - name: Compilations déjà faites
         id: deja
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -133,9 +180,9 @@ jobs:
             ~/.cargo/git/db
             outil/target
           # Une clé par exécution : chaque exécution repart de la plus récente et garde la sienne.
-          key: essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*.rs') }}-${{ github.run_id }}
+          key: essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*') }}-${{ github.run_id }}
           restore-keys: |
-            essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*.rs') }}-
+            essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*') }}-
             essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-
       # « --locked » : les versions de dépendances que l'outil a lui-même éprouvées, et pas d'autres.
       # Le compilateur déborde de sa pile sur l'une des bibliothèques de Solana et conseille
@@ -163,47 +210,76 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             outil/target
-          key: essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*.rs') }}-${{ github.run_id }}
+          key: essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*') }}-${{ github.run_id }}
+      # Le greffon écrit le flux dans des tubes ; un programme d'empreintes lit chacun au fil
+      # de l'eau, dans un interprète qui ignore tout de son entourage (« -I »).
       - name: Relecture
         env:
           JETSTREAMER_CLICKHOUSE_MODE: "off"
         run: |
-          mkdir -p "$ESSAI_SORTIE"
+          mkdir -p "$ESSAI_SORTIE" "$RUNNER_TEMP/voies"
+          tubes=(); lecteurs=(); dossiers=()
+          for (( voie = 0; voie < ESSAI_NOMBRE_DE_VOIES; voie++ )); do
+            tube="$RUNNER_TEMP/voies/tube-$voie"
+            mkfifo "$tube"
+            tubes+=("$tube"); dossiers+=("$RUNNER_TEMP/voies/empreintes-$voie")
+            python -I empreintes/empreintes.py --definitions "$RUNNER_TEMP/definitions" \
+              --plage "$ESSAI_PLAGE" --coupe "$COUPE" --tranche "$ESSAI_TRANCHE" \
+              --echantillon "$ESSAI_ECHANTILLON" --sortie "$RUNNER_TEMP/voies/empreintes-$voie" \
+              < "$tube" > "$RUNNER_TEMP/voies/resume-$voie.json" 2> "$ESSAI_SORTIE/journal-voie-$voie.txt" &
+            lecteurs+=($!)
+          done
+          ESSAI_VOIES=$(IFS=,; echo "${tubes[*]}")
+          export ESSAI_VOIES
           # Octets reçus par la carte qui porte la route par défaut, et elle seule : la machine
           # montre la même réception sous deux cartes (la carte et sa doublure), et les
           # additionner comptait double (constaté à l'exécution n° 44329878008).
           carte=$(ip -o route get 1.1.1.1 2> /dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' || true)
           echo "carte de la route par défaut : ${carte:-aucune}"
           recu() { cat "/sys/class/net/${carte:-eth0}/statistics/rx_bytes" 2> /dev/null || echo 0; }
-          # Le compte de chaque carte, pour contrôle.
-          cartes() {
-            awk 'NR > 2 { sub(/^ +/, ""); split($0, champs, /[: ]+/); printf "%s=%s ", champs[1], champs[2] }
-              END { print "" }' /proc/net/dev
-          }
-          echo "cartes avant : $(cartes)"
           avant=$(recu); depart=$SECONDS
           # Passé la durée dite, la lecture est arrêtée comme par Ctrl-C, et l'étape échoue avec
-          # le code 124 : les comptes rendus sont alors ceux d'une plage lue en partie.
+          # le code 124 : les empreintes rendues sont alors celles d'une plage lue en partie.
           issue=0
           timeout --signal=INT --kill-after=120 "${ESSAI_MINUTES}m" \
             /usr/bin/time -v outil/target/release/examples/essai || issue=$?
           echo "relecture : code $issue, $((SECONDS - depart)) s, $(( ($(recu) - avant) / 1000000 )) Mo reçus du réseau"
-          echo "cartes après : $(cartes)"
-          exit "$issue"
+          # Un lecteur dont le tube n'a jamais été ouvert en écriture attend encore : l'ouvrir
+          # et le refermer le libère. Quand le lecteur a déjà fini, l'ouverture ne répond pas et
+          # s'arrête d'elle-même.
+          for tube in "${tubes[@]}"; do
+            # shellcheck disable=SC2016
+            timeout 5 bash -c ': > "$0"' "$tube" || true
+          done
+          lectures=0
+          for voie in "${!lecteurs[@]}"; do
+            code=0; wait "${lecteurs[$voie]}" || code=$?
+            echo "voie $voie : programme d'empreintes, code $code"
+            (( code == 0 )) || lectures=1
+          done
+          echo "empreintes : $((SECONDS - depart)) s depuis le début de la relecture"
+          fusion=0
+          python -I empreintes/empreintes.py --fusionner "${dossiers[@]}" \
+            --sortie "$RUNNER_TEMP/voies/fusion" > /dev/null || fusion=$?
+          echo "fusion des voies : code $fusion"
+          if [[ -s "$RUNNER_TEMP/voies/fusion/resume.json" ]]; then
+            cp "$RUNNER_TEMP/voies/fusion/resume.json" "$ESSAI_SORTIE/empreintes.json"
+            cp "$RUNNER_TEMP/voies/fusion/tranches.csv" "$RUNNER_TEMP/voies/fusion/slots.csv" "$ESSAI_SORTIE/"
+          fi
+          (( issue == 0 )) || exit "$issue"
+          (( lectures == 0 && fusion == 0 )) || exit 1
       - name: Résultats
         if: always()
         run: |
           cd "$ESSAI_SORTIE" 2> /dev/null || { echo "aucun résultat"; exit 0; }
-          ls -l
-          cat resume.json 2> /dev/null || echo "pas de résumé"
-          if [[ -s comptes.csv ]]; then
-            echo "slots comptés : $(( $(wc -l < comptes.csv) - 1 ))"
-            awk -F, 'NR > 1 { gardees += $2; echouees += $3 } END { print "gardées : " gardees ", dont échouées : " echouees }' comptes.csv
-          fi
-          if [[ -s transactions.jsonl ]]; then
-            echo "transactions entières : $(wc -l < transactions.jsonl) ligne(s)"
-            zstd --quiet --rm -10 transactions.jsonl
-          fi
+          find . -maxdepth 1 -name 'journal-voie-*.txt' -size 0 -delete
+          tail -n 20 journal-voie-*.txt 2> /dev/null || true
+          cat resume.json 2> /dev/null || echo "pas de résumé du greffon"
+          cat empreintes.json 2> /dev/null || echo "pas d'empreintes"
+          [[ -s a_part.flux ]] && zstd --quiet --rm -19 a_part.flux
+          [[ -e a_part.flux ]] && rm a_part.flux
+          [[ -s slots.csv ]] && zstd --quiet --rm -19 slots.csv
+          [[ -s tranches.csv ]] && zstd --quiet --rm -19 tranches.csv
           ls -l
       - name: Pièce jointe
         if: always()

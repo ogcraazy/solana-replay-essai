@@ -1,5 +1,5 @@
-//! Outils du greffon d'essai, sans autre dépendance que la bibliothèque standard :
-//! lecture des saisies (adresses, plage, slots) et écriture de texte JSON.
+//! Outils du greffon de l'atelier, sans autre dépendance que la bibliothèque standard :
+//! lecture des saisies (adresses, plage, transactions nommées) et écriture de texte JSON.
 
 const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -45,27 +45,19 @@ pub fn plage(texte: &str) -> Option<(u64, u64)> {
     }
 }
 
-/// Des slots séparés par des virgules ; une liste vide n'en nomme aucun. Rien si l'un d'eux
-/// n'est pas un nombre.
-pub fn slots(liste: &str) -> Option<Vec<u64>> {
+/// Des transactions nommées par « slot/rang », séparées par des virgules ; une liste vide n'en
+/// nomme aucune. Rien si l'un des couples n'est pas fait de deux nombres.
+pub fn couples(liste: &str) -> Option<Vec<(u64, u64)>> {
     if liste.trim().is_empty() {
         return Some(Vec::new());
     }
     liste
         .split(',')
-        .map(|texte| texte.trim().parse::<u64>().ok())
+        .map(|texte| {
+            let (slot, rang) = texte.trim().split_once('/')?;
+            Some((slot.parse::<u64>().ok()?, rang.parse::<u64>().ok()?))
+        })
         .collect()
-}
-
-/// Des octets en chiffres hexadécimaux, deux par octet.
-pub fn hexa(octets: &[u8]) -> String {
-    const CHIFFRES: &[u8; 16] = b"0123456789abcdef";
-    let mut texte = String::with_capacity(octets.len() * 2);
-    for &octet in octets {
-        texte.push(CHIFFRES[usize::from(octet >> 4)] as char);
-        texte.push(CHIFFRES[usize::from(octet & 0x0f)] as char);
-    }
-    texte
 }
 
 /// Un texte en chaîne JSON, guillemets compris.
@@ -103,6 +95,11 @@ pub fn ou_rien<T>(valeur: Option<T>, ecrire: impl FnOnce(T) -> String) -> String
 #[cfg(test)]
 mod essais {
     use super::*;
+
+    /// Des octets en chiffres hexadécimaux, deux par octet.
+    fn hexa(octets: &[u8]) -> String {
+        octets.iter().map(|octet| format!("{octet:02x}")).collect()
+    }
 
     #[test]
     fn une_adresse_se_lit_en_ses_octets() {
@@ -159,17 +156,24 @@ mod essais {
     }
 
     #[test]
-    fn des_slots_se_lisent_ou_la_liste_est_refusee() {
-        assert_eq!(slots(""), Some(vec![]));
-        assert_eq!(slots(" 3, 1,2 "), Some(vec![3, 1, 2]));
-        assert_eq!(slots("1,,2"), None);
-        assert_eq!(slots("1,x"), None);
+    fn des_transactions_nommees_se_lisent_ou_la_liste_est_refusee() {
+        assert_eq!(couples(""), Some(vec![]));
+        assert_eq!(couples("  "), Some(vec![]));
+        assert_eq!(
+            couples(" 470331010/3, 470331011/0 "),
+            Some(vec![(470_331_010, 3), (470_331_011, 0)])
+        );
+        assert_eq!(couples("5/7"), Some(vec![(5, 7)]));
+        assert_eq!(couples("5"), None);
+        assert_eq!(couples("5/"), None);
+        assert_eq!(couples("/7"), None);
+        assert_eq!(couples("5/7,,6/1"), None);
+        assert_eq!(couples("5/x"), None);
+        assert_eq!(couples("5/7/9"), None);
     }
 
     #[test]
     fn le_json_s_ecrit_sans_ambiguite() {
-        assert_eq!(hexa(&[]), "");
-        assert_eq!(hexa(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
         assert_eq!(chaine("abc"), "\"abc\"");
         assert_eq!(chaine("a\"b\\c\nd\te\rf"), "\"a\\\"b\\\\c\\nd\\te\\rf\"");
         assert_eq!(chaine("\u{1}é\u{1f}"), "\"\\u0001é\\u001f\"");

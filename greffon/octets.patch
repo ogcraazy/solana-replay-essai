@@ -1,0 +1,86 @@
+diff --git a/jetstreamer-firehose/src/firehose.rs b/jetstreamer-firehose/src/firehose.rs
+index 87195b7..7a3ab4d 100644
+--- a/jetstreamer-firehose/src/firehose.rs
++++ b/jetstreamer-firehose/src/firehose.rs
+@@ -1025,6 +1025,32 @@ fn proto_commission_in_basis_points(
+         .any(|reward| !reward.commission_bps.is_empty())
+ }
+ 
++/// Atelier : comme `decode_transaction_status_meta_from_frame`, et rend aussi les octets du
++/// compte rendu tels que l'archive les garde, une fois décompressés.
++fn decode_transaction_status_meta_and_bytes_from_frame(
++    slot: u64,
++    reassembled_metadata: Vec<u8>,
++) -> Result<(solana_transaction_status::TransactionStatusMeta, Vec<u8>), SharedError> {
++    if reassembled_metadata.is_empty() {
++        return Ok((
++            solana_transaction_status::TransactionStatusMeta::default(),
++            Vec::new(),
++        ));
++    }
++    // Comme l'original : des octets qui ne sont pas compressés sont décodés tels quels.
++    let decompressed = utils::decompress_zstd(reassembled_metadata.as_slice());
++    let bytes = match decompressed {
++        Ok(decompressed) => decompressed,
++        Err(_) => reassembled_metadata,
++    };
++    let meta = decode_transaction_status_meta(slot, bytes.as_slice()).map_err(|err| {
++        Box::new(std::io::Error::other(format!(
++            "decode transaction metadata (slot {slot}): {err}"
++        ))) as SharedError
++    })?;
++    Ok((meta, bytes))
++}
++
+ fn decode_transaction_status_meta(
+     slot: u64,
+     metadata_bytes: &[u8],
+@@ -1229,6 +1255,19 @@ pub struct TransactionData {
+     pub transaction_status_meta: solana_transaction_status::TransactionStatusMeta,
+     /// Fully decoded transaction.
+     pub transaction: VersionedTransaction,
++    /// Atelier : le compte rendu d'exécution tel que l'archive le garde, décompressé (du
++    /// protobuf pour les époques récentes) ; vide si l'archive n'en a pas.
++    pub transaction_status_meta_bytes: Vec<u8>,
++}
++
++impl TransactionData {
++    /// Atelier : la transaction au format protobuf du stockage de Solana (le message
++    /// `Transaction` de `solana-storage-proto`), par la conversion de cette bibliothèque.
++    pub fn transaction_proto_bytes(&self) -> Vec<u8> {
++        let proto: solana_storage_proto::convert::generated::Transaction =
++            self.transaction.clone().into();
++        prost_014::Message::encode_to_vec(&proto)
++    }
+ }
+ 
+ /// Block entry metadata passed to [`Handler`] callbacks.
+@@ -2103,7 +2142,7 @@ where
+                                                 )
+                                             })?;
+ 
+-                                        let as_native_metadata = decode_transaction_status_meta_from_frame(
++                                        let (as_native_metadata, metadata_bytes) = decode_transaction_status_meta_and_bytes_from_frame(
+                                             block.slot,
+                                             reassembled_metadata,
+                                         )
+@@ -2159,6 +2198,7 @@ where
+                                                 is_vote,
+                                                 transaction_status_meta: as_native_metadata,
+                                                 transaction: versioned_tx,
++                                                transaction_status_meta_bytes: metadata_bytes,
+                                             },
+                                         )
+                                         .await
+diff --git a/jetstreamer-plugin/src/plugins/pubkey_stats.rs b/jetstreamer-plugin/src/plugins/pubkey_stats.rs
+index d3f9f81..b7c5173 100644
+--- a/jetstreamer-plugin/src/plugins/pubkey_stats.rs
++++ b/jetstreamer-plugin/src/plugins/pubkey_stats.rs
+@@ -325,6 +325,7 @@ mod tests {
+                 signatures: vec![],
+                 message: VersionedMessage::Legacy(message),
+             },
++            transaction_status_meta_bytes: Vec::new(),
+         }
+     }
+ 
