@@ -1,0 +1,21 @@
+diff --git a/jetstreamer-firehose/src/firehose.rs b/jetstreamer-firehose/src/firehose.rs
+index 9ec3c06..87195b7 100644
+--- a/jetstreamer-firehose/src/firehose.rs
++++ b/jetstreamer-firehose/src/firehose.rs
+@@ -3485,12 +3485,10 @@ fn convert_proto_rewards(
+                 2 => RewardType::Staking,
+                 3 => RewardType::Voting,
+                 4 => RewardType::DeactivatedStake,
+-                typ => {
+-                    return Err(Box::new(std::io::Error::other(format!(
+-                        "unsupported reward type {}",
+-                        typ
+-                    ))));
+-                }
++                // Atelier : une récompense d'un type que cette version ne connaît pas est passée
++                // sans être lue (le greffon ne lit aucune récompense) ; sans cela, le premier
++                // bloc de chaque époque est refusé depuis l'époque 1064.
++                _ => continue,
+             },
+             lamports: proto_reward.lamports,
+             post_balance: proto_reward.post_balance,

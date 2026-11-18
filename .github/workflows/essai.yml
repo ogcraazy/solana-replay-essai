@@ -1,9 +1,10 @@
 name: Essai de relecture
 
 # La recette de l'essai : elle prend l'outil libre Jetstreamer à un commit fixé, y pose le
-# greffon de ce dépôt, compile, relit une plage de slots de l'archive publique Old Faithful
-# et rend ce que le greffon a compté. Elle ne se lance qu'à la main, ne lit aucun secret et
-# n'écrit rien ailleurs que dans les pièces jointes de l'exécution.
+# greffon de ce dépôt et un correctif de quatre lignes, compile, relit une plage de slots de
+# l'archive publique Old Faithful et rend ce que le greffon a compté. Elle ne se lance qu'à
+# la main et ne lit aucun secret ; ses résultats, des données publiques de la chaîne, sont
+# déposés sur la branche « resultats » de ce dépôt.
 
 on:
   workflow_dispatch:
@@ -113,8 +114,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev time zstd
           clang --version | head -1
+      # Le correctif : depuis l'époque 1064, le premier bloc de chaque époque porte des
+      # récompenses d'un type que cette version de l'outil refuse, et la lecture n'en sort pas
+      # (constaté à l'exécution n° 44329878008). Le greffon ne lit aucune récompense : le
+      # correctif les fait passer sans les lire, et ne touche à rien d'autre.
       - name: Greffon posé dans l'outil
         run: |
+          git -C outil apply --verbose "$GITHUB_WORKSPACE/greffon/recompenses.patch"
           mkdir -p outil/examples/essai
           cp greffon/main.rs greffon/outils.rs outil/examples/essai/
       - name: Compilations déjà faites
@@ -163,13 +169,13 @@ jobs:
           JETSTREAMER_CLICKHOUSE_MODE: "off"
         run: |
           mkdir -p "$ESSAI_SORTIE"
-          # Octets reçus du réseau, toutes cartes confondues sauf la boucle locale.
-          recu() {
-            awk 'NR > 2 { sub(/^ +/, ""); split($0, champs, /[: ]+/); if (champs[1] != "lo") octets += champs[2] }
-              END { printf "%d\n", octets }' /proc/net/dev
-          }
-          # Le même compte carte par carte : sur certaines machines, une même réception paraît
-          # sous deux cartes (la carte et sa doublure), et le total la compte alors deux fois.
+          # Octets reçus par la carte qui porte la route par défaut, et elle seule : la machine
+          # montre la même réception sous deux cartes (la carte et sa doublure), et les
+          # additionner comptait double (constaté à l'exécution n° 44329878008).
+          carte=$(ip -o route get 1.1.1.1 2> /dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' || true)
+          echo "carte de la route par défaut : ${carte:-aucune}"
+          recu() { cat "/sys/class/net/${carte:-eth0}/statistics/rx_bytes" 2> /dev/null || echo 0; }
+          # Le compte de chaque carte, pour contrôle.
           cartes() {
             awk 'NR > 2 { sub(/^ +/, ""); split($0, champs, /[: ]+/); printf "%s=%s ", champs[1], champs[2] }
               END { print "" }' /proc/net/dev
