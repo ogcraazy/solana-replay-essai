@@ -126,12 +126,18 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             outil/target
-          key: essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*.rs') }}
+          # Une clé par exécution : chaque exécution repart de la plus récente et garde la sienne.
+          key: essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*.rs') }}-${{ github.run_id }}
           restore-keys: |
+            essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*.rs') }}-
             essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-
       # « --locked » : les versions de dépendances que l'outil a lui-même éprouvées, et pas d'autres.
+      # Le compilateur déborde de sa pile sur l'une des bibliothèques de Solana et conseille
+      # lui-même de l'agrandir (constaté à la première exécution).
       - name: Compilation
         working-directory: outil
+        env:
+          RUST_MIN_STACK: "134217728"
         run: |
           if [[ "$ESSAI_OPTIMISATION" == rapide ]]; then
             export CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
@@ -140,9 +146,10 @@ jobs:
           cargo build --release --locked --example essai
           echo "compilation : $((SECONDS - depart)) s"
           ls -l target/release/examples/essai && du -sh target
-      # Gardées dès maintenant : une relecture qui échoue ne doit pas coûter une compilation.
+      # Gardées dès maintenant, même si la compilation s'est arrêtée en route : ni une relecture
+      # qui échoue ni une reprise ne doivent coûter ce qui est déjà compilé.
       - name: Compilations gardées
-        if: steps.deja.outputs.cache-hit != 'true'
+        if: always() && steps.deja.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -150,7 +157,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             outil/target
-          key: essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*.rs') }}
+          key: essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*.rs') }}-${{ github.run_id }}
       - name: Relecture
         env:
           JETSTREAMER_CLICKHOUSE_MODE: "off"
