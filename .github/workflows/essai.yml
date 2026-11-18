@@ -29,6 +29,11 @@ on:
       fils:
         description: Nombre de fils de lecture (vide = au choix de l'outil)
         default: ""
+      ordre:
+        description: « parallele », plusieurs fils lisent chacun sa part de la plage ; « sequentiel », un seul fil la rend dans l'ordre de la chaîne
+        type: choice
+        options: [parallele, sequentiel]
+        default: parallele
       minutes:
         description: Durée au plus de la relecture, en minutes (300 au plus)
         default: "20"
@@ -82,6 +87,7 @@ jobs:
           VOIES: ${{ inputs.voies }}
           ECHANTILLON: ${{ inputs.echantillon }}
           FILS: ${{ inputs.fils }}
+          ORDRE: ${{ inputs.ordre }}
           MINUTES: ${{ inputs.minutes }}
           OPTIMISATION: ${{ inputs.optimisation }}
         run: |
@@ -98,6 +104,7 @@ jobs:
             refuse "échantillon, un nombre au moins égal à 1"
           fi
           [[ "$FILS" =~ ^[0-9]{0,3}$ ]] || refuse "fils"
+          [[ "$ORDRE" == parallele || "$ORDRE" == sequentiel ]] || refuse "ordre"
           if ! [[ "$MINUTES" =~ ^[0-9]{1,3}$ ]] || (( 10#$MINUTES < 1 || 10#$MINUTES > 300 )); then
             refuse "minutes, de 1 à 300"
           fi
@@ -110,6 +117,7 @@ jobs:
             echo "ESSAI_ECHANTILLON=$((10#$ECHANTILLON))"
             echo "ESSAI_TRANCHE=100"
             echo "ESSAI_FILS=$FILS"
+            echo "ESSAI_ORDRE=$ORDRE"
             echo "ESSAI_MINUTES=$((10#$MINUTES))"
             echo "ESSAI_OPTIMISATION=$OPTIMISATION"
             echo "ESSAI_SORTIE=$RUNNER_TEMP/resultat"

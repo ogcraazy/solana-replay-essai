@@ -15,6 +15,9 @@
 //! - `ESSAI_A_PART` : transactions dont l'enregistrement est aussi écrit dans `a_part.flux`,
 //!   « slot/rang » séparés par des virgules (peut rester vide) ;
 //! - `ESSAI_FILS` : nombre de fils de lecture (vide : au choix de l'outil) ;
+//! - `ESSAI_ORDRE` : `parallele` (ou vide), plusieurs fils lisent chacun sa part de la plage ;
+//!   `sequentiel`, un seul fil rend la plage dans l'ordre de la chaîne, l'outil ne gardant
+//!   plusieurs connexions que pour télécharger ;
 //! - `ESSAI_SORTIE` : répertoire des résultats.
 //!
 //! Résultats : `resume.json`, les comptes du greffon, et `a_part.flux`. Chaque voie commence
@@ -32,6 +35,12 @@
 //! rendre, pour connaître le parent du premier bloc. Le résumé compte les en-têtes qui ont
 //! attendu, ceux dont le parent est resté inconnu (écrits alors avec ce que l'outil donnait) et
 //! les désaccords entre l'outil, quand il dit un hash, et le bloc parent.
+//!
+//! L'ordre du flux. Pour un bloc, l'outil passe ses transactions puis son en-tête. Le résumé
+//! compte ce qui s'écarte de l'ordre de la chaîne : les en-têtes écrits après celui d'un slot
+//! égal ou plus haut, et les transactions gardées arrivées après l'en-tête de leur slot ou
+//! d'un slot plus haut. Avec plusieurs fils, ces comptes sont grands, et c'est attendu ; en
+//! ordre séquentiel ils devraient être nuls, et le résumé dit s'ils le sont.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -107,6 +116,10 @@ struct Essai {
     sautes: AtomicU64,
     reprises: AtomicU64,
     ecrites_a_part: AtomicU64,
+    /// Le plus haut slot dont l'en-tête est écrit.
+    plus_haut: AtomicU64,
+    reculs: AtomicU64,
+    retards: AtomicU64,
     /// Le premier et le dernier bloc daté : (slot, heure).
     heures: Mutex<Option<((u64, i64), (u64, i64))>>,
 }
@@ -162,6 +175,9 @@ impl Essai {
         if outils::adresse(&bloc.donne) != Some([0u8; 32]) && bloc.donne != hash_parent {
             self.desaccords.fetch_add(1, Ordering::Relaxed);
         }
+        if self.plus_haut.fetch_max(bloc.slot, Ordering::Relaxed) >= bloc.slot {
+            self.reculs.fetch_add(1, Ordering::Relaxed);
+        }
         let voie = self.voie(bloc.slot);
         let entete = flux::Entete {
             slot: bloc.slot,
@@ -187,7 +203,7 @@ impl Essai {
     fn rendre(
         &self,
         plage: (u64, u64),
-        saisies: (&str, &str),
+        saisies: (&str, &str, bool),
         duree_s: f64,
         sans_erreur: bool,
     ) -> std::io::Result<()> {
@@ -231,11 +247,13 @@ impl Essai {
             })
         };
         let heures = *self.heures.lock().expect("heures des blocs");
-        let (programmes, fils) = saisies;
+        let (programmes, fils, sequentiel) = saisies;
+        let ordre = if sequentiel { "sequentiel" } else { "parallele" };
         let champs = [
             format!("\"plage\":[{},{}]", plage.0, plage.1),
             format!("\"programmes\":{}", outils::chaine(programmes)),
             format!("\"fils\":{}", outils::chaine(fils)),
+            format!("\"ordre\":{}", outils::chaine(ordre)),
             format!("\"tranche\":{}", self.tranche),
             format!("\"slots_de_la_plage\":{}", plage.1 - plage.0 + 1),
             format!("\"lecture_sans_erreur\":{sans_erreur}"),
@@ -264,6 +282,8 @@ impl Essai {
             format!("\"parents_differes\":{}", lu(&self.differes)),
             format!("\"parents_inconnus\":{}", lu(&self.inconnus)),
             format!("\"parents_en_desaccord\":{}", lu(&self.desaccords)),
+            format!("\"en_tetes_en_recul\":{}", lu(&self.reculs)),
+            format!("\"transactions_en_retard\":{}", lu(&self.retards)),
             format!("\"voies\":{}", outils::liste(par_voie)),
             format!("\"a_part_demandees\":{}", self.a_part.len()),
             format!("\"a_part_ecrites\":{}", lu(&self.ecrites_a_part)),
@@ -303,6 +323,9 @@ impl Plugin for Greffon {
                 essai.echouees.fetch_add(1, Ordering::Relaxed);
             }
             let slot = transaction.slot;
+            if slot <= essai.plus_haut.load(Ordering::Relaxed) {
+                essai.retards.fetch_add(1, Ordering::Relaxed);
+            }
             let rang = transaction.transaction_slot_index as u64;
             let signature: &[u8] = transaction.signature.as_ref();
             let signee = transaction.transaction_proto_bytes();
@@ -453,6 +476,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let programmes = saisie("ESSAI_PROGRAMMES");
     let suivis = outils::adresses(&programmes).ok_or("ESSAI_PROGRAMMES : adresses illisibles")?;
     let fils = saisie("ESSAI_FILS");
+    let sequentiel = match saisie("ESSAI_ORDRE").trim() {
+        "" | "parallele" => false,
+        "sequentiel" => true,
+        _ => return Err("ESSAI_ORDRE : « parallele » ou « sequentiel » attendu".into()),
+    };
     let tranche = match saisie("ESSAI_TRANCHE").trim() {
         "" => 100,
         texte => texte
@@ -510,6 +538,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sautes: AtomicU64::new(0),
         reprises: AtomicU64::new(0),
         ecrites_a_part: AtomicU64::new(0),
+        plus_haut: AtomicU64::new(0),
+        reculs: AtomicU64::new(0),
+        retards: AtomicU64::new(0),
         heures: Mutex::new(None),
     });
     for (rang, voie) in essai.voies.iter().enumerate() {
@@ -534,11 +565,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|_| "ESSAI_FILS : nombre attendu")?;
         lanceur = lanceur.with_threads(nombre);
     }
+    if sequentiel {
+        lanceur = lanceur.with_sequential(true);
+    }
     let depart = Instant::now();
     let issue = lanceur.run();
     essai.rendre(
         plage,
-        (programmes.as_str(), fils.as_str()),
+        (programmes.as_str(), fils.as_str(), sequentiel),
         depart.elapsed().as_secs_f64(),
         issue.is_ok(),
     )?;
