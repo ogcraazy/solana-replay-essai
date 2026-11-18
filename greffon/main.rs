@@ -22,9 +22,19 @@
 //! sans bloc et une reprise de lecture y laissent aussi un événement. Quand la lecture bute et
 //! reprend, les transactions du slot en cours sont rendues une seconde fois : à qui lit le flux
 //! de les reconnaître. Une voie qui ne s'écrit plus arrête tout, avec le code 3.
+//!
+//! Le hash du bloc parent. L'outil ne le lit pas dans l'archive : il rend celui du bloc qu'il a
+//! lu juste avant sur la même connexion, et un hash nul pour le premier bloc de chaque connexion.
+//! Or le hash du parent d'un bloc est, par construction de la chaîne, le hash du bloc de son
+//! slot parent. Le greffon retient donc le hash de chaque bloc lu et écrit, pour chaque en-tête,
+//! celui du bloc de son slot parent ; un en-tête dont le parent n'est pas encore lu (un autre fil
+//! le lira) attend la fin de la lecture, et quelques slots sont lus avant la plage, sans rien en
+//! rendre, pour connaître le parent du premier bloc. Le résumé compte les en-têtes qui ont
+//! attendu, ceux dont le parent est resté inconnu (écrits alors avec ce que l'outil donnait) et
+//! les désaccords entre l'outil, quand il dit un hash, et le bloc parent.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::PathBuf,
@@ -45,6 +55,23 @@ use jetstreamer::{
 mod flux;
 mod outils;
 
+/// Slots lus avant la plage sans rien en rendre : leurs blocs disent le hash du parent du
+/// premier bloc de la plage.
+const MARGE: u64 = 64;
+
+/// L'en-tête d'un bloc de la plage, en attendant le hash de son parent.
+struct Bloc {
+    slot: u64,
+    hash: String,
+    heure: Option<i64>,
+    hauteur: Option<u64>,
+    parent: u64,
+    executees: u64,
+    entrees: u64,
+    /// Ce que l'outil donne pour hash du parent.
+    donne: String,
+}
+
 /// Une voie du flux, et ce qui y a été écrit.
 struct Voie {
     sortie: Mutex<BufWriter<File>>,
@@ -61,6 +88,16 @@ struct Essai {
     a_part: BTreeSet<(u64, u64)>,
     part: Mutex<BufWriter<File>>,
     sortie: PathBuf,
+    /// Le premier slot de la plage : ce qui est lu avant lui n'est pas rendu.
+    debut: u64,
+    /// Le hash de chaque bloc lu, par slot.
+    hashs: Mutex<HashMap<u64, String>>,
+    /// Les en-têtes dont le bloc parent n'était pas encore lu.
+    en_attente: Mutex<Vec<Bloc>>,
+    avant: AtomicU64,
+    differes: AtomicU64,
+    inconnus: AtomicU64,
+    desaccords: AtomicU64,
     vues: AtomicU64,
     votes: AtomicU64,
     gardees: AtomicU64,
@@ -113,7 +150,40 @@ impl Essai {
         }
     }
 
-    /// Ferme le flux (un événement `fin` par voie) et écrit le résumé.
+    /// Le hash du bloc lu à ce slot, s'il l'a été.
+    fn hash_du_bloc(&self, slot: u64) -> Option<String> {
+        self.hashs.lock().expect("hashs des blocs").get(&slot).cloned()
+    }
+
+    /// Écrit l'en-tête d'un bloc dans sa voie, avec ce hash pour parent.
+    fn ecrire_entete(&self, bloc: &Bloc, hash_parent: &str) {
+        // Quand l'outil dit un hash (il rend un hash nul au premier bloc d'une connexion), ce
+        // doit être celui du bloc parent.
+        if outils::adresse(&bloc.donne) != Some([0u8; 32]) && bloc.donne != hash_parent {
+            self.desaccords.fetch_add(1, Ordering::Relaxed);
+        }
+        let voie = self.voie(bloc.slot);
+        let entete = flux::Entete {
+            slot: bloc.slot,
+            hash: &bloc.hash,
+            heure: bloc.heure,
+            hauteur: bloc.hauteur,
+            parent: bloc.parent,
+            hash_parent,
+            executees: bloc.executees,
+            entrees: bloc.entrees,
+        };
+        {
+            let mut sortie = voie.sortie.lock().expect("voie");
+            if let Err(erreur) = flux::ecrire_entete(&mut *sortie, &entete) {
+                abandonner("voie", &erreur);
+            }
+        }
+        voie.blocs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Écrit les en-têtes qui attendaient le hash de leur parent, ferme le flux (un événement
+    /// `fin` par voie) et écrit le résumé.
     fn rendre(
         &self,
         plage: (u64, u64),
@@ -121,6 +191,20 @@ impl Essai {
         duree_s: f64,
         sans_erreur: bool,
     ) -> std::io::Result<()> {
+        let attendaient = std::mem::take(&mut *self.en_attente.lock().expect("en-têtes en attente"));
+        for bloc in &attendaient {
+            match self.hash_du_bloc(bloc.parent) {
+                Some(hash_parent) => self.ecrire_entete(bloc, &hash_parent),
+                None => {
+                    self.inconnus.fetch_add(1, Ordering::Relaxed);
+                    self.evenement(
+                        self.voie(bloc.slot),
+                        &format!("{{\"e\":\"parent_inconnu\",\"slot\":{}}}", bloc.slot),
+                    );
+                    self.ecrire_entete(bloc, &bloc.donne);
+                }
+            }
+        }
         let lu = |compte: &AtomicU64| compte.load(Ordering::Relaxed);
         let mut par_voie = Vec::with_capacity(self.voies.len());
         for (rang, voie) in self.voies.iter().enumerate() {
@@ -175,6 +259,11 @@ impl Essai {
                 borne(heures.map(|(_, dernier)| dernier))
             ),
             format!("\"reprises\":{}", lu(&self.reprises)),
+            format!("\"marge_de_lecture\":{MARGE}"),
+            format!("\"avant_la_plage\":{}", lu(&self.avant)),
+            format!("\"parents_differes\":{}", lu(&self.differes)),
+            format!("\"parents_inconnus\":{}", lu(&self.inconnus)),
+            format!("\"parents_en_desaccord\":{}", lu(&self.desaccords)),
             format!("\"voies\":{}", outils::liste(par_voie)),
             format!("\"a_part_demandees\":{}", self.a_part.len()),
             format!("\"a_part_ecrites\":{}", lu(&self.ecrites_a_part)),
@@ -197,6 +286,10 @@ impl Plugin for Greffon {
     ) -> PluginFuture<'a> {
         Box::pin(async move {
             let essai = &self.0;
+            if transaction.slot < essai.debut {
+                essai.avant.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
             essai.vues.fetch_add(1, Ordering::Relaxed);
             if transaction.is_vote {
                 essai.votes.fetch_add(1, Ordering::Relaxed);
@@ -257,7 +350,6 @@ impl Plugin for Greffon {
     ) -> PluginFuture<'a> {
         Box::pin(async move {
             let essai = &self.0;
-            let voie = essai.voie(bloc.slot());
             match bloc {
                 BlockData::Block {
                     parent_slot,
@@ -270,29 +362,20 @@ impl Plugin for Greffon {
                     entry_count,
                     ..
                 } => {
+                    let hash = blockhash.to_string();
+                    essai
+                        .hashs
+                        .lock()
+                        .expect("hashs des blocs")
+                        .insert(*slot, hash.clone());
+                    if *slot < essai.debut {
+                        essai.avant.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
                     essai.blocs.fetch_add(1, Ordering::Relaxed);
                     essai
                         .executees
                         .fetch_add(*executed_transaction_count, Ordering::Relaxed);
-                    let hash = blockhash.to_string();
-                    let hash_parent = parent_blockhash.to_string();
-                    let entete = flux::Entete {
-                        slot: *slot,
-                        hash: &hash,
-                        heure: *block_time,
-                        hauteur: *block_height,
-                        parent: *parent_slot,
-                        hash_parent: &hash_parent,
-                        executees: *executed_transaction_count,
-                        entrees: *entry_count,
-                    };
-                    {
-                        let mut sortie = voie.sortie.lock().expect("voie");
-                        if let Err(erreur) = flux::ecrire_entete(&mut *sortie, &entete) {
-                            abandonner("voie", &erreur);
-                        }
-                    }
-                    voie.blocs.fetch_add(1, Ordering::Relaxed);
                     if let Some(heure) = block_time {
                         let vu = (*slot, *heure);
                         let mut heures = essai.heures.lock().expect("heures des blocs");
@@ -301,8 +384,33 @@ impl Plugin for Greffon {
                             Some((premier, dernier)) => (premier.min(vu), dernier.max(vu)),
                         });
                     }
+                    let lu = Bloc {
+                        slot: *slot,
+                        hash,
+                        heure: *block_time,
+                        hauteur: *block_height,
+                        parent: *parent_slot,
+                        executees: *executed_transaction_count,
+                        entrees: *entry_count,
+                        donne: parent_blockhash.to_string(),
+                    };
+                    match essai.hash_du_bloc(*parent_slot) {
+                        Some(hash_parent) => essai.ecrire_entete(&lu, &hash_parent),
+                        None => {
+                            essai.differes.fetch_add(1, Ordering::Relaxed);
+                            essai
+                                .en_attente
+                                .lock()
+                                .expect("en-têtes en attente")
+                                .push(lu);
+                        }
+                    }
                 }
                 BlockData::PossibleLeaderSkipped { slot } => {
+                    if *slot < essai.debut {
+                        return Ok(());
+                    }
+                    let voie = essai.voie(*slot);
                     essai.sautes.fetch_add(1, Ordering::Relaxed);
                     essai.evenement(voie, &format!("{{\"e\":\"sans_bloc\",\"slot\":{slot}}}"));
                     voie.sans_bloc.fetch_add(1, Ordering::Relaxed);
@@ -386,6 +494,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         a_part: a_part.into_iter().collect(),
         part: Mutex::new(BufWriter::new(File::create(sortie.join("a_part.flux"))?)),
         sortie,
+        debut: plage.0,
+        hashs: Mutex::new(HashMap::new()),
+        en_attente: Mutex::new(Vec::new()),
+        avant: AtomicU64::new(0),
+        differes: AtomicU64::new(0),
+        inconnus: AtomicU64::new(0),
+        desaccords: AtomicU64::new(0),
         vues: AtomicU64::new(0),
         votes: AtomicU64::new(0),
         gardees: AtomicU64::new(0),
@@ -411,7 +526,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lanceur = JetstreamerRunner::new()
         .with_log_level("info")
         .with_plugin(Box::new(Greffon(essai.clone())))
-        .with_slot_range_bounds(plage.0, plage.1 + 1);
+        .with_slot_range_bounds(plage.0.saturating_sub(MARGE), plage.1 + 1);
     if !fils.trim().is_empty() {
         let nombre: usize = fils
             .trim()
