@@ -1,0 +1,22 @@
+{
+  "plage":[432000000,432000019],
+  "programmes":"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P,pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+  "fils":"",
+  "slots_de_la_plage":20,
+  "lecture_sans_erreur":true,
+  "duree_s":5.6,
+  "transactions_vues":21621,
+  "dont_votes":13770,
+  "transactions_gardees":1912,
+  "dont_echouees":816,
+  "slots_avec_transactions_gardees":20,
+  "blocs":20,
+  "transactions_annoncees_par_les_blocs":21621,
+  "slots_sans_bloc":0,
+  "premier_bloc":{"slot":432000000,"heure":1783681917},
+  "dernier_bloc":{"slot":432000019,"heure":1783681925},
+  "reprises":0,
+  "slots_entiers_demandes":0,
+  "transactions_entieres_ecrites":0,
+  "ecriture_ratee":false
+}
