@@ -199,3 +199,41 @@ jobs:
           path: ${{ runner.temp }}/resultat
           if-no-files-found: warn
           retention-days: 14
+
+  # Les résultats sont des données publiques de la chaîne. Cette tâche les dépose sur la
+  # branche « resultats » du dépôt ; elle seule a le droit d'y écrire, et elle n'exécute aucun
+  # code venu d'ailleurs.
+  rendre:
+    name: Déposer les résultats
+    needs: essai
+    if: always() && needs.essai.result != 'cancelled' && needs.essai.result != 'skipped'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Dépôt
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Résultats de la relecture
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: resultat
+          path: ${{ runner.temp }}/resultat
+      - name: Branche des résultats
+        env:
+          EXECUTION: ${{ github.run_id }}
+        run: |
+          if git fetch --quiet --depth 1 origin resultats; then
+            git checkout --quiet -B resultats FETCH_HEAD
+          else
+            git checkout --quiet --orphan resultats
+            git rm -r --quiet --force .
+          fi
+          mkdir -p "executions/$EXECUTION"
+          cp "$RUNNER_TEMP"/resultat/* "executions/$EXECUTION/"
+          git add executions
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet --message "Résultats de l'exécution $EXECUTION"
+          git push --quiet origin resultats
+          ls -l "executions/$EXECUTION"
