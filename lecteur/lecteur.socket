@@ -1,0 +1,19 @@
+# Le lecteur de l'archive publique attend les demandes : une connexion, une demande, un
+# processus. L'adresse, le port et le nombre de demandes servies à la fois sont posés à
+# l'installation (lecteur.socket.d/ecoute.conf, écrit par installer.sh).
+[Unit]
+Description=Lecteur de l'archive publique : attend les demandes
+
+[Socket]
+Accept=yes
+# L'écoute s'ouvre même si l'adresse de la machine n'est pas encore en place.
+FreeBind=yes
+# Un client parti sans prévenir (machine éteinte, réseau coupé) finit par se voir : la
+# connexion est alors fermée, et la lecture s'arrête à la première écriture.
+KeepAlive=yes
+KeepAliveTimeSec=60
+KeepAliveIntervalSec=10
+KeepAliveProbes=6
+
+[Install]
+WantedBy=sockets.target

@@ -1,12 +1,18 @@
 name: Essai de relecture
 
-# La recette de l'atelier : elle prend l'outil libre Jetstreamer à un commit fixé, y pose le
-# greffon de ce dépôt et deux correctifs, compile, relit une plage de slots de l'archive
-# publique Old Faithful et rend le flux des transactions des programmes donnés, au format
-# Yellowstone gRPC, à un programme d'empreintes qui le lit au fil de l'eau : rien du flux
-# n'est gardé, hors les transactions nommées. Elle ne se lance qu'à la main et ne lit aucun
-# secret ; ses résultats, des données publiques de la chaîne, sont déposés sur la branche
-# « resultats » de ce dépôt.
+# L'épreuve de l'atelier : elle prend l'outil libre Jetstreamer à un commit fixé, y pose le
+# greffon de ce dépôt et deux correctifs, compile (scripts du dossier « recette »), relit une
+# plage de slots de l'archive publique Old Faithful et rend le flux des transactions des
+# programmes donnés, au format Yellowstone gRPC, à un programme d'empreintes qui le lit au fil
+# de l'eau : rien du flux n'est gardé, hors ce qui est nommé. Elle ne se lance qu'à la main et
+# ne lit aucun secret ; ses résultats, des données publiques de la chaîne, sont déposés sur la
+# branche « resultats » de ce dépôt.
+#
+# Deux modes. « voies » : le programme écrit le flux dans des tubes, plusieurs fils lisant
+# chacun sa part de la plage. « service » : le lecteur est installé sur la machine de
+# l'exécution comme il le serait sur une machine louée (scripts du dossier « lecteur »), la
+# plage lui est adressée comme une vraie demande, par le réseau de la machine même, puis ses
+# garde-fous sont contrôlés un à un.
 
 on:
   workflow_dispatch:
@@ -17,11 +23,21 @@ on:
       programmes:
         description: Adresses des programmes à garder, en base 58, séparées par des virgules
         required: true
+      mode:
+        description: « voies », le flux part dans des tubes ; « service », le lecteur est installé et reçoit la plage comme une demande
+        type: choice
+        options: [voies, service]
+        default: voies
       a_part:
-        description: Transactions dont l'enregistrement est gardé, « slot/rang » séparés par des virgules (peut rester vide)
+        description: Mode « voies » - transactions dont l'enregistrement est gardé, « slot/rang » séparés par des virgules (peut rester vide)
         default: ""
+      garder_flux:
+        description: Mode « service » - garder le flux reçu avec les résultats (plage de 20 slots au plus)
+        type: choice
+        options: [non, oui]
+        default: non
       voies:
-        description: Nombre de voies du flux, chacune lue par un programme d'empreintes (1 à 8)
+        description: Mode « voies » - nombre de voies du flux, chacune lue par un programme d'empreintes (1 à 8)
         default: "3"
       echantillon:
         description: Une tranche de slots sur N porte le détail champ par champ
@@ -30,7 +46,7 @@ on:
         description: Nombre de fils de lecture (vide = au choix de l'outil)
         default: ""
       ordre:
-        description: « parallele », plusieurs fils lisent chacun sa part de la plage ; « sequentiel », un seul fil la rend dans l'ordre de la chaîne
+        description: Mode « voies » - « parallele », plusieurs fils lisent chacun sa part de la plage ; « sequentiel », un seul fil la rend dans l'ordre de la chaîne
         type: choice
         options: [parallele, sequentiel]
         default: parallele
@@ -83,7 +99,9 @@ jobs:
         env:
           PLAGE: ${{ inputs.plage }}
           PROGRAMMES: ${{ inputs.programmes }}
+          MODE: ${{ inputs.mode }}
           A_PART: ${{ inputs.a_part }}
+          GARDER_FLUX: ${{ inputs.garder_flux }}
           VOIES: ${{ inputs.voies }}
           ECHANTILLON: ${{ inputs.echantillon }}
           FILS: ${{ inputs.fils }}
@@ -109,7 +127,22 @@ jobs:
             refuse "minutes, de 1 à 300"
           fi
           [[ "$OPTIMISATION" == rapide || "$OPTIMISATION" == complete ]] || refuse "optimisation"
+          [[ "$MODE" == voies || "$MODE" == service ]] || refuse "mode"
+          [[ "$GARDER_FLUX" == non || "$GARDER_FLUX" == oui ]] || refuse "garder le flux, « oui » ou « non »"
+          slots=$(( 10#$fin - 10#$debut + 1 ))
+          if [[ "$MODE" == service ]]; then
+            # Ce que le lecteur refuserait de toute façon, dit avant de compiler.
+            (( slots <= 432000 )) || refuse "mode « service » : une plage de 432 000 slots au plus"
+            [[ -z "$A_PART" ]] || refuse "mode « service » : pas de transactions à part"
+          fi
+          if [[ "$GARDER_FLUX" == oui ]]; then
+            [[ "$MODE" == service ]] || refuse "garder le flux : en mode « service » seulement"
+            # Un slot pèse environ un million et demi d'octets de flux.
+            (( slots <= 20 )) || refuse "garder le flux : pour une plage de 20 slots au plus"
+          fi
           {
+            echo "ESSAI_MODE=$MODE"
+            echo "ESSAI_GARDER_FLUX=$GARDER_FLUX"
             echo "ESSAI_PLAGE=$((10#$debut)):$((10#$fin))"
             echo "ESSAI_PROGRAMMES=$PROGRAMMES"
             echo "ESSAI_A_PART=$A_PART"
@@ -160,35 +193,17 @@ jobs:
           ls -l "$RUNNER_TEMP/definitions"
           python --version
           python -c 'import google.protobuf; print("protobuf", google.protobuf.__version__)'
-      - name: Dépendances de compilation
+      # Les scripts de la recette et du lecteur : leur syntaxe, et ce qu'un relecteur automatique
+      # y trouverait à redire.
+      - name: Scripts
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev time zstd
-          clang --version | head -1
-      # Les modules du greffon qui ne dépendent que de la bibliothèque standard portent leurs
-      # propres essais : ils passent ici, avec le compilateur que l'outil demande, avant toute
-      # compilation de l'outil.
-      - name: Essais des modules
-        working-directory: outil
-        run: |
-          mkdir -p "$RUNNER_TEMP/essais"
-          for module in flux outils suivi demande; do
-            rustc --edition 2024 --test "$GITHUB_WORKSPACE/greffon/$module.rs" -o "$RUNNER_TEMP/essais/$module"
-            "$RUNNER_TEMP/essais/$module"
+          for script in recette/*.sh lecteur/*.sh lecteur/servir; do
+            bash -n "$script"
           done
-      # Deux correctifs, et rien d'autre. Le premier : depuis l'époque 1064, le premier bloc
-      # de chaque époque porte des récompenses d'un type que cette version de l'outil refuse,
-      # et la lecture n'en sort pas (constaté à l'exécution n° 44329878008) ; le greffon ne lit
-      # aucune récompense, le correctif les fait passer sans les lire. Le second : l'outil rend
-      # au greffon, en plus du compte rendu d'exécution qu'il a décodé, les octets de ce compte
-      # rendu tels que l'archive les garde, et la transaction signée au format du flux par la
-      # conversion de la bibliothèque de Solana ; il ne change rien à ce que l'outil lit.
-      - name: Greffon posé dans l'outil
-        run: |
-          git -C outil apply --verbose "$GITHUB_WORKSPACE/greffon/recompenses.patch"
-          git -C outil apply --verbose "$GITHUB_WORKSPACE/greffon/octets.patch"
-          mkdir -p outil/examples/essai
-          cp greffon/main.rs greffon/flux.rs greffon/outils.rs greffon/suivi.rs greffon/demande.rs outil/examples/essai/
+          shellcheck recette/*.sh lecteur/*.sh lecteur/servir
+          [[ "$(< recette/OUTIL)" == "$OUTIL" ]] || { echo "::error::recette/OUTIL ne dit pas le commit de l'outil pris ici"; exit 1; }
+      - name: Dépendances de compilation
+        run: sudo bash recette/dependances.sh
       - name: Compilations déjà faites
         id: deja
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -203,25 +218,11 @@ jobs:
           restore-keys: |
             essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-${{ hashFiles('greffon/*') }}-
             essai-${{ runner.os }}-${{ env.OUTIL }}-${{ env.ESSAI_OPTIMISATION }}-
-      # « --locked » : les versions de dépendances que l'outil a lui-même éprouvées, et pas d'autres.
-      # Le compilateur déborde de sa pile sur l'une des bibliothèques de Solana et conseille
-      # lui-même de l'agrandir (constaté à la première exécution).
-      - name: Compilation
-        working-directory: outil
-        env:
-          RUST_MIN_STACK: "134217728"
-          # Inscrits dans le programme, et redits par l'événement « debut » de chaque flux : le
-          # commit de l'atelier dont il est construit, et celui de l'outil.
-          ESSAI_ATELIER: ${{ github.sha }}
-          ESSAI_OUTIL: ${{ env.OUTIL }}
-        run: |
-          if [[ "$ESSAI_OPTIMISATION" == rapide ]]; then
-            export CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-          fi
-          depart=$SECONDS
-          cargo build --release --locked --example essai
-          echo "compilation : $((SECONDS - depart)) s"
-          ls -l target/release/examples/essai && du -sh target
+      # Les essais des modules du greffon, les deux correctifs, le greffon posé dans l'outil et
+      # la compilation : le même script que sur une machine louée. Le programme porte le commit
+      # de cet atelier et celui de l'outil, qu'il redit en tête de chaque flux.
+      - name: Construction
+        run: bash recette/construire.sh outil "$ESSAI_OPTIMISATION"
       # Gardées dès maintenant, même si la compilation s'est arrêtée en route : ni une relecture
       # qui échoue ni une reprise ne doivent coûter ce qui est déjà compilé.
       - name: Compilations gardées
@@ -237,6 +238,7 @@ jobs:
       # Le greffon écrit le flux dans des tubes ; un programme d'empreintes lit chacun au fil
       # de l'eau, dans un interprète qui ignore tout de son entourage (« -I »).
       - name: Relecture
+        if: env.ESSAI_MODE == 'voies'
         env:
           JETSTREAMER_CLICKHOUSE_MODE: "off"
         run: |
@@ -291,6 +293,99 @@ jobs:
           fi
           (( issue == 0 )) || exit "$issue"
           (( lectures == 0 && fusion == 0 )) || exit 1
+      # En mode « service », le lecteur est installé sur cette machine comme il le serait sur
+      # une machine louée : le système écoute un port de la machine même, et lance le programme
+      # à chaque connexion, sous un utilisateur passager.
+      - name: Lecteur installé
+        if: env.ESSAI_MODE == 'service'
+        run: |
+          systemctl --version | head -1
+          sudo bash lecteur/installer.sh "$PWD/outil/target/release/examples/essai" 127.0.0.1 7411 2
+          sudo systemd-analyze verify lecteur.socket 'lecteur@0.service' || true
+          systemctl --no-pager --full status lecteur.socket || true
+      # D'où partir : le dernier slot à bloc d'avant la plage, lu dans l'index de l'archive —
+      # celui de l'époque de la plage, ou de la précédente quand la plage ouvre son époque.
+      - name: Départ de la lecture
+        if: env.ESSAI_MODE == 'service'
+        run: |
+          debut="${ESSAI_PLAGE%%:*}"
+          epoque=$((debut / 432000))
+          prendre() {
+            curl --silent --show-error --fail --location --max-time 120 \
+              --output "$RUNNER_TEMP/index-$1.raw" "$ARCHIVE/$1/epoch-$1-slot-ranges.raw"
+            echo "index de l'époque $1 : $(sha256sum < "$RUNNER_TEMP/index-$1.raw" | cut -d' ' -f1)"
+          }
+          prendre "$epoque"
+          depart=$(python releve/octets.py "$RUNNER_TEMP/index-$epoque.raw" "$epoque" avant "$debut")
+          if [[ "$depart" == - ]]; then
+            prendre "$((epoque - 1))"
+            depart=$(python releve/octets.py "$RUNNER_TEMP/index-$((epoque - 1)).raw" \
+              "$((epoque - 1))" avant "$((epoque * 432000))")
+          fi
+          [[ "$depart" =~ ^[0-9]+$ ]] \
+            || { echo "::error::aucun bloc avant la plage, ni dans son époque ni dans la précédente"; exit 1; }
+          echo "départ de la lecture : slot $depart, $((debut - depart)) slot(s) avant la plage"
+          echo "DEPART=$depart" >> "$GITHUB_ENV"
+      # La demande, telle qu'un client la ferait : une ligne, puis le flux jusqu'à ce que le
+      # lecteur ferme la connexion. Le flux passe au programme d'empreintes au fil de l'eau.
+      - name: Demande
+        if: env.ESSAI_MODE == 'service'
+        run: |
+          mkdir -p "$ESSAI_SORTIE" "$RUNNER_TEMP/voies"
+          garde=/dev/null
+          if [[ "$ESSAI_GARDER_FLUX" == oui ]]; then
+            garde="$ESSAI_SORTIE/demande.flux"
+          fi
+          carte=$(ip -o route get 1.1.1.1 2> /dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' || true)
+          recu() { cat "/sys/class/net/${carte:-eth0}/statistics/rx_bytes" 2> /dev/null || echo 0; }
+          avant=$(recu); depart=$SECONDS
+          # Passé la durée dite, le client s'en va : le lecteur s'arrête de lui-même, et les
+          # empreintes rendues sont alors celles d'une plage lue en partie.
+          set +e
+          timeout --signal=TERM --kill-after=30 "${ESSAI_MINUTES}m" \
+            bash lecteur/demander.sh 127.0.0.1 7411 "v1 $ESSAI_PLAGE $DEPART $ESSAI_PROGRAMMES" \
+            | tee "$garde" \
+            | python -I empreintes/empreintes.py --definitions "$RUNNER_TEMP/definitions" \
+              --plage "$ESSAI_PLAGE" --coupe "$COUPE" --tranche "$ESSAI_TRANCHE" \
+              --echantillon "$ESSAI_ECHANTILLON" --sortie "$RUNNER_TEMP/voies/empreintes-0" \
+              > "$RUNNER_TEMP/voies/resume-0.json" 2> "$ESSAI_SORTIE/journal-voie-0.txt"
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          echo "demande : code ${codes[0]} ; programme d'empreintes : code ${codes[2]}"
+          echo "lecture : $((SECONDS - depart)) s, $(( ($(recu) - avant) / 1000000 )) Mo reçus du réseau"
+          fusion=0
+          python -I empreintes/empreintes.py --fusionner "$RUNNER_TEMP/voies/empreintes-0" \
+            --sortie "$RUNNER_TEMP/voies/fusion" > /dev/null || fusion=$?
+          echo "résumé des empreintes : code $fusion"
+          if [[ -s "$RUNNER_TEMP/voies/fusion/resume.json" ]]; then
+            cp "$RUNNER_TEMP/voies/fusion/resume.json" "$ESSAI_SORTIE/empreintes.json"
+            cp "$RUNNER_TEMP/voies/fusion/tranches.csv" "$RUNNER_TEMP/voies/fusion/slots.csv" "$ESSAI_SORTIE/"
+          fi
+          (( codes[0] == 0 )) || exit "${codes[0]}"
+          (( codes[2] == 0 && fusion == 0 )) || exit 1
+      # Les garde-fous du lecteur, un à un : une demande refusée, une ligne trop longue, une
+      # ligne qui ne vient pas, un client qui s'en va ; puis, le lecteur réinstallé pour une
+      # seule demande à la fois, une connexion de trop.
+      - name: Contrôles du lecteur
+        if: env.ESSAI_MODE == 'service'
+        run: |
+          echecs=0
+          bash lecteur/controles.sh 127.0.0.1 7411 /usr/local/lib/lecteur/essai \
+            "v1 $ESSAI_PLAGE $DEPART $ESSAI_PROGRAMMES" || echecs=$((echecs + $?))
+          sudo bash lecteur/installer.sh "$PWD/outil/target/release/examples/essai" 127.0.0.1 7411 1
+          bash lecteur/controles.sh 127.0.0.1 7411 /usr/local/lib/lecteur/essai borne \
+            || echecs=$((echecs + $?))
+          echo "contrôles en échec : $echecs"
+          (( echecs == 0 ))
+      - name: Journal du lecteur
+        if: always() && env.ESSAI_MODE == 'service'
+        run: |
+          mkdir -p "$ESSAI_SORTIE"
+          sudo journalctl --no-pager --output=short-iso -u lecteur.socket -u 'lecteur@*' \
+            > "$ESSAI_SORTIE/journal-lecteur.txt" || true
+          echo "lignes du journal : $(wc -l < "$ESSAI_SORTIE/journal-lecteur.txt")"
+          # Ce que le système et le lanceur ont dit, sans le détail de l'outil.
+          grep -E 'systemd\[|servir : |essai : ' "$ESSAI_SORTIE/journal-lecteur.txt" | tail -n 80 || true
       - name: Résultats
         if: always()
         run: |
@@ -301,6 +396,9 @@ jobs:
           cat empreintes.json 2> /dev/null || echo "pas d'empreintes"
           [[ -s a_part.flux ]] && zstd --quiet --rm -19 a_part.flux
           [[ -e a_part.flux ]] && rm a_part.flux
+          [[ -s demande.flux ]] && zstd --quiet --rm -19 demande.flux
+          [[ -e demande.flux ]] && rm demande.flux
+          [[ -s journal-lecteur.txt ]] && zstd --quiet --rm -19 journal-lecteur.txt
           [[ -s slots.csv ]] && zstd --quiet --rm -19 slots.csv
           [[ -s tranches.csv ]] && zstd --quiet --rm -19 tranches.csv
           ls -l

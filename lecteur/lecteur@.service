@@ -1,0 +1,39 @@
+# Une demande au lecteur : le système lance cette unité à chaque connexion, et lui donne la
+# connexion sur le descripteur 3.
+[Unit]
+Description=Lecteur de l'archive publique : une demande
+# Une demande finie, refusée ou interrompue ne laisse pas d'unité derrière elle.
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/local/lib/lecteur/servir
+# Rien ne vient de l'entrée standard ; ce que le programme et ses bibliothèques disent va au
+# journal de la machine, jamais dans la connexion.
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+# L'outil ne garde rien dans une base : il lit l'archive et rend le flux.
+Environment=JETSTREAMER_CLICKHOUSE_MODE=off
+
+# Un utilisateur qui n'existe que le temps de la demande, sans droit d'écrire ailleurs que
+# dans un dossier temporaire à lui, qui disparaît avec lui.
+DynamicUser=yes
+PrivateTmp=yes
+WorkingDirectory=/tmp
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Le programme ne parle qu'à l'internet : l'archive, et la connexion qu'on lui a donnée.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Bornes : une journée au plus par demande, et moins de la moitié de la mémoire de la machine.
+RuntimeMaxSec=86400
+MemoryMax=45%

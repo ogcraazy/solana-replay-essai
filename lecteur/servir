@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Sert une demande. Le système de la machine (systemd) écoute le port et lance ce script à
+# chaque connexion, en la lui donnant sur le descripteur 3. Le script y lit la ligne de la
+# demande, puis laisse la place au programme de lecture, qui écrit le flux sur ce même
+# descripteur ; ce que le programme dit d'autre va au journal de la machine.
+#
+# La ligne doit venir entière, avec son saut de ligne, en dix secondes : sinon rien n'est
+# lancé, et la connexion se ferme sans un octet. Au plus 1 025 octets sont lus : une ligne
+# plus longue est passée telle quelle au programme, qui la refuse et le dit à qui demande,
+# sans rien lire de l'archive. Les octets sont pris tels qu'ils arrivent, à ceci près que
+# l'interprète laisse tomber les octets nuls ; c'est le programme qui juge la ligne.
+set -u
+# Les longueurs se comptent en octets, quels que soient les réglages de la machine.
+export LC_ALL=C
+
+# Le programme est posé à côté de ce script.
+programme="$(dirname "$(readlink -f "$0")")/essai"
+
+if ! { true >&3; } 2> /dev/null; then
+  echo "servir : pas de connexion sur le descripteur 3" >&2
+  exit 5
+fi
+
+demande=""
+if ! IFS= read -r -t 10 -n 1025 -u 3 demande; then
+  echo "servir : pas de ligne entière en dix secondes, rien n'est lancé" >&2
+  exit 4
+fi
+
+ESSAI_DEMANDE="$demande" ESSAI_VOIES=fd:3 exec "$programme"
