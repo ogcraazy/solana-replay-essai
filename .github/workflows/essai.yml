@@ -210,6 +210,10 @@ jobs:
         working-directory: outil
         env:
           RUST_MIN_STACK: "134217728"
+          # Inscrits dans le programme, et redits par l'événement « debut » de chaque flux : le
+          # commit de l'atelier dont il est construit, et celui de l'outil.
+          ESSAI_ATELIER: ${{ github.sha }}
+          ESSAI_OUTIL: ${{ env.OUTIL }}
         run: |
           if [[ "$ESSAI_OPTIMISATION" == rapide ]]; then
             export CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16

@@ -10,7 +10,8 @@
 //! Saisies, par l'environnement :
 //! - `ESSAI_PLAGE` : « début:fin », bornes comprises ;
 //! - `ESSAI_PROGRAMMES` : adresses en base 58, séparées par des virgules ;
-//! - `ESSAI_VOIES` : chemins des voies, séparés par des virgules ;
+//! - `ESSAI_VOIES` : chemins des voies, séparés par des virgules ; « fd:N » (N de 3 à 9)
+//!   désigne un descripteur que le lanceur a déjà ouvert pour le flux ;
 //! - `ESSAI_TRANCHE` : nombre de slots d'une tranche (vide : 100) ;
 //! - `ESSAI_A_PART` : transactions dont l'enregistrement est aussi écrit dans `a_part.flux`,
 //!   « slot/rang » séparés par des virgules (peut rester vide) ;
@@ -18,7 +19,14 @@
 //! - `ESSAI_ORDRE` : `parallele` (ou vide), plusieurs fils lisent chacun sa part de la plage ;
 //!   `sequentiel`, un seul fil rend la plage dans l'ordre de la chaîne, l'outil ne gardant
 //!   plusieurs connexions que pour télécharger ;
-//! - `ESSAI_SORTIE` : répertoire des résultats.
+//! - `ESSAI_AVANT` : le slot d'où partir, avant la plage (vide : soixante-quatre slots avant
+//!   elle) — ce qui est lu avant la plage n'est pas rendu, et dit le hash du parent du
+//!   premier bloc ;
+//! - `ESSAI_SORTIE` : répertoire des résultats ; vide, rien n'est écrit hors des voies (et
+//!   `ESSAI_A_PART` doit alors rester vide).
+//!
+//! Deux valeurs sont lues à la compilation et redites par l'événement `debut` : `ESSAI_ATELIER`,
+//! le commit de l'atelier dont le programme est construit, et `ESSAI_OUTIL`, celui de l'outil.
 //!
 //! Résultats : `resume.json`, les comptes du greffon, et `a_part.flux`. Chaque voie commence
 //! par un événement `debut` et finit par un événement `fin` qui dit ce qu'elle a reçu ; un slot
@@ -32,7 +40,9 @@
 //! slot parent. Le greffon retient donc le hash de chaque bloc lu et écrit, pour chaque en-tête,
 //! celui du bloc de son slot parent ; un en-tête dont le parent n'est pas encore lu (un autre fil
 //! le lira) attend la fin de la lecture, et quelques slots sont lus avant la plage, sans rien en
-//! rendre, pour connaître le parent du premier bloc. Le résumé compte les en-têtes qui ont
+//! rendre, pour connaître le parent du premier bloc. En ordre séquentiel aucun autre fil ne
+//! le lira : l'en-tête est écrit aussitôt, précédé de l'événement `parent_inconnu`, pour que
+//! le flux reste dans l'ordre de la chaîne. Le résumé compte les en-têtes qui ont
 //! attendu, ceux dont le parent est resté inconnu (écrits alors avec ce que l'outil donnait) et
 //! les désaccords entre l'outil, quand il dit un hash, et le bloc parent.
 //!
@@ -52,6 +62,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
+    os::fd::FromRawFd,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -71,9 +82,20 @@ mod flux;
 mod outils;
 mod suivi;
 
-/// Slots lus avant la plage sans rien en rendre : leurs blocs disent le hash du parent du
-/// premier bloc de la plage.
+/// Slots lus avant la plage sans rien en rendre, quand le départ n'est pas donné : leurs blocs
+/// disent le hash du parent du premier bloc de la plage.
 const MARGE: u64 = 64;
+
+/// Le commit de l'atelier dont ce programme est construit, et celui de l'outil : donnés à la
+/// compilation, vides sinon.
+const ATELIER: &str = match option_env!("ESSAI_ATELIER") {
+    Some(commit) => commit,
+    None => "",
+};
+const OUTIL: &str = match option_env!("ESSAI_OUTIL") {
+    Some(commit) => commit,
+    None => "",
+};
 
 /// L'en-tête d'un bloc de la plage, en attendant le hash de son parent.
 struct Bloc {
@@ -102,15 +124,20 @@ struct Essai {
     tranche: u64,
     voies: Vec<Voie>,
     a_part: BTreeSet<(u64, u64)>,
-    part: Mutex<BufWriter<File>>,
-    sortie: PathBuf,
+    /// Le fichier des transactions à part et le répertoire des résultats, s'il y en a un.
+    part: Option<Mutex<BufWriter<File>>>,
+    sortie: Option<PathBuf>,
     /// Le premier slot de la plage : ce qui est lu avant lui n'est pas rendu.
     debut: u64,
+    /// Le slot d'où part la lecture.
+    avant: u64,
+    /// Un seul fil rend la plage, dans l'ordre de la chaîne.
+    sequentiel: bool,
     /// Le hash de chaque bloc lu, par slot.
     hashs: Mutex<HashMap<u64, String>>,
     /// Les en-têtes dont le bloc parent n'était pas encore lu.
     en_attente: Mutex<Vec<Bloc>>,
-    avant: AtomicU64,
+    lus_avant: AtomicU64,
     differes: AtomicU64,
     inconnus: AtomicU64,
     desaccords: AtomicU64,
@@ -207,6 +234,17 @@ impl Essai {
         voie.blocs.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Écrit l'en-tête d'un bloc dont le parent n'a pas été lu, avec ce que l'outil donnait
+    /// pour hash du parent, et le dit par un événement.
+    fn ecrire_sans_parent(&self, bloc: &Bloc) {
+        self.inconnus.fetch_add(1, Ordering::Relaxed);
+        self.evenement(
+            self.voie(bloc.slot),
+            &format!("{{\"e\":\"parent_inconnu\",\"slot\":{}}}", bloc.slot),
+        );
+        self.ecrire_entete(bloc, &bloc.donne);
+    }
+
     /// Écrit les en-têtes qui attendaient le hash de leur parent, ferme le flux (un événement
     /// `fin` par voie) et écrit le résumé.
     fn rendre(
@@ -220,14 +258,7 @@ impl Essai {
         for bloc in &attendaient {
             match self.hash_du_bloc(bloc.parent) {
                 Some(hash_parent) => self.ecrire_entete(bloc, &hash_parent),
-                None => {
-                    self.inconnus.fetch_add(1, Ordering::Relaxed);
-                    self.evenement(
-                        self.voie(bloc.slot),
-                        &format!("{{\"e\":\"parent_inconnu\",\"slot\":{}}}", bloc.slot),
-                    );
-                    self.ecrire_entete(bloc, &bloc.donne);
-                }
+                None => self.ecrire_sans_parent(bloc),
             }
         }
         let lu = |compte: &AtomicU64| compte.load(Ordering::Relaxed);
@@ -250,7 +281,12 @@ impl Essai {
             voie.sortie.lock().expect("voie").flush()?;
             par_voie.push(format!("{{{comptes}}}"));
         }
-        self.part.lock().expect("transactions à part").flush()?;
+        if let Some(part) = &self.part {
+            part.lock().expect("transactions à part").flush()?;
+        }
+        let Some(sortie) = &self.sortie else {
+            return Ok(());
+        };
 
         let borne = |bloc: Option<(u64, i64)>| {
             outils::ou_rien(bloc, |(slot, heure)| {
@@ -289,8 +325,8 @@ impl Essai {
             ),
             format!("\"reprises\":{reprises}"),
             format!("\"blocs_incomplets\":{incomplets}"),
-            format!("\"marge_de_lecture\":{MARGE}"),
-            format!("\"avant_la_plage\":{}", lu(&self.avant)),
+            format!("\"marge_de_lecture\":{}", plage.0 - self.avant),
+            format!("\"avant_la_plage\":{}", lu(&self.lus_avant)),
             format!("\"parents_differes\":{}", lu(&self.differes)),
             format!("\"parents_inconnus\":{}", lu(&self.inconnus)),
             format!("\"parents_en_desaccord\":{}", lu(&self.desaccords)),
@@ -300,7 +336,7 @@ impl Essai {
             format!("\"a_part_demandees\":{}", self.a_part.len()),
             format!("\"a_part_ecrites\":{}", lu(&self.ecrites_a_part)),
         ];
-        let mut resume = File::create(self.sortie.join("resume.json"))?;
+        let mut resume = File::create(sortie.join("resume.json"))?;
         writeln!(resume, "{{\n  {}\n}}", champs.join(",\n  "))
     }
 }
@@ -319,7 +355,7 @@ impl Plugin for Greffon {
         Box::pin(async move {
             let essai = &self.0;
             if transaction.slot < essai.debut {
-                essai.avant.fetch_add(1, Ordering::Relaxed);
+                essai.lus_avant.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
             essai.vues.fetch_add(1, Ordering::Relaxed);
@@ -361,8 +397,10 @@ impl Plugin for Greffon {
                 }
             }
             voie.transactions.fetch_add(1, Ordering::Relaxed);
-            if essai.a_part.contains(&(slot, rang)) {
-                let mut part = essai.part.lock().expect("transactions à part");
+            if let Some(part) = &essai.part
+                && essai.a_part.contains(&(slot, rang))
+            {
+                let mut part = part.lock().expect("transactions à part");
                 if let Err(erreur) = flux::ecrire_transaction(
                     &mut *part,
                     slot,
@@ -407,7 +445,7 @@ impl Plugin for Greffon {
                         .expect("hashs des blocs")
                         .insert(*slot, hash.clone());
                     if *slot < essai.debut {
-                        essai.avant.fetch_add(1, Ordering::Relaxed);
+                        essai.lus_avant.fetch_add(1, Ordering::Relaxed);
                         return Ok(());
                     }
                     essai.blocs.fetch_add(1, Ordering::Relaxed);
@@ -435,6 +473,8 @@ impl Plugin for Greffon {
                     };
                     match essai.hash_du_bloc(*parent_slot) {
                         Some(hash_parent) => essai.ecrire_entete(&lu, &hash_parent),
+                        // En ordre séquentiel, aucun autre fil ne lira ce parent plus tard.
+                        None if essai.sequentiel => essai.ecrire_sans_parent(&lu),
                         None => {
                             essai.differes.fetch_add(1, Ordering::Relaxed);
                             essai
@@ -485,6 +525,34 @@ impl Plugin for Greffon {
     }
 }
 
+/// Ouvre une voie : un chemin (d'ordinaire un tube, dont l'ouverture attend le lecteur), ou
+/// « fd:N », un descripteur que le lanceur a ouvert pour le flux.
+fn ouvrir_voie(texte: &str) -> Result<File, Box<dyn std::error::Error>> {
+    let Some(numero) = texte.strip_prefix("fd:") else {
+        let fichier = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(texte)?;
+        return Ok(fichier);
+    };
+    let numero: i32 = numero
+        .parse()
+        .ok()
+        .filter(|numero| (3..=9).contains(numero))
+        .ok_or("ESSAI_VOIES : « fd:N » attendu, N de 3 à 9")?;
+    // SAFETY : le descripteur est donné à ce programme par celui qui le lance, pour le flux
+    // et pour lui seul ; rien d'autre ici ne l'ouvre ni ne le ferme.
+    let fichier = unsafe { File::from_raw_fd(numero) };
+    // Un descripteur qui n'est pas ouvert se dit tout de suite, pas à la première écriture ;
+    // et il n'y a alors rien à fermer.
+    if let Err(erreur) = fichier.metadata() {
+        std::mem::forget(fichier);
+        return Err(format!("ESSAI_VOIES : descripteur {numero} : {erreur}").into());
+    }
+    Ok(fichier)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let saisie = |nom: &str| std::env::var(nom).unwrap_or_default();
     let plage =
@@ -507,23 +575,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let a_part =
         outils::couples(&saisie("ESSAI_A_PART")).ok_or("ESSAI_A_PART : « slot/rang » illisibles")?;
-    let sortie = PathBuf::from(saisie("ESSAI_SORTIE"));
-    if sortie.as_os_str().is_empty() {
-        return Err("ESSAI_SORTIE : répertoire attendu".into());
+    let sortie = match saisie("ESSAI_SORTIE") {
+        vide if vide.is_empty() => None,
+        chemin => Some(PathBuf::from(chemin)),
+    };
+    if sortie.is_none() && !a_part.is_empty() {
+        return Err("ESSAI_A_PART : il faut alors ESSAI_SORTIE, le répertoire des résultats".into());
     }
-    std::fs::create_dir_all(&sortie)?;
+    let avant = match saisie("ESSAI_AVANT").trim() {
+        "" => plage.0.saturating_sub(MARGE),
+        texte => texte
+            .parse::<u64>()
+            .ok()
+            .filter(|avant| *avant < plage.0)
+            .ok_or("ESSAI_AVANT : slot attendu, avant la plage")?,
+    };
     let chemins = saisie("ESSAI_VOIES");
     if chemins.trim().is_empty() {
         return Err("ESSAI_VOIES : au moins une voie attendue".into());
     }
-    // Une voie est d'ordinaire un tube : l'ouvrir attend que son lecteur soit là.
     let mut voies = Vec::new();
     for chemin in chemins.split(',') {
-        let fichier = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(chemin.trim())?;
+        let fichier = ouvrir_voie(chemin.trim())?;
         voies.push(Voie {
             sortie: Mutex::new(BufWriter::with_capacity(1 << 20, fichier)),
             transactions: AtomicU64::new(0),
@@ -531,17 +604,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sans_bloc: AtomicU64::new(0),
         });
     }
+    let part = match &sortie {
+        Some(sortie) => {
+            std::fs::create_dir_all(sortie)?;
+            let fichier = File::create(sortie.join("a_part.flux"))?;
+            Some(Mutex::new(BufWriter::new(fichier)))
+        }
+        None => None,
+    };
     let essai = Arc::new(Essai {
         programmes: suivis,
         tranche,
         voies,
         a_part: a_part.into_iter().collect(),
-        part: Mutex::new(BufWriter::new(File::create(sortie.join("a_part.flux"))?)),
+        part,
         sortie,
         debut: plage.0,
+        avant,
+        sequentiel,
         hashs: Mutex::new(HashMap::new()),
         en_attente: Mutex::new(Vec::new()),
-        avant: AtomicU64::new(0),
+        lus_avant: AtomicU64::new(0),
         differes: AtomicU64::new(0),
         inconnus: AtomicU64::new(0),
         desaccords: AtomicU64::new(0),
@@ -564,17 +647,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         essai.evenement(
             voie,
             &format!(
-                "{{\"e\":\"debut\",\"plage\":[{},{}],\"voie\":{rang},\"voies\":{},\"tranche\":{tranche}}}",
+                "{{\"e\":\"debut\",\"plage\":[{},{}],\"voie\":{rang},\"voies\":{},\"tranche\":{tranche},\"ordre\":{},\"avant\":{avant},\"atelier\":{},\"outil\":{}}}",
                 plage.0,
                 plage.1,
-                essai.voies.len()
+                essai.voies.len(),
+                outils::chaine(if sequentiel { "sequentiel" } else { "parallele" }),
+                outils::chaine(ATELIER),
+                outils::chaine(OUTIL)
             ),
         );
     }
     let mut lanceur = JetstreamerRunner::new()
         .with_log_level("info")
         .with_plugin(Box::new(Greffon(essai.clone())))
-        .with_slot_range_bounds(plage.0.saturating_sub(MARGE), plage.1 + 1);
+        .with_slot_range_bounds(avant, plage.1 + 1);
     if !fils.trim().is_empty() {
         let nombre: usize = fils
             .trim()
