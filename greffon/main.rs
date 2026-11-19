@@ -25,6 +25,12 @@
 //! - `ESSAI_SORTIE` : répertoire des résultats ; vide, rien n'est écrit hors des voies (et
 //!   `ESSAI_A_PART` doit alors rester vide).
 //!
+//! Ou bien, pour servir une demande : `ESSAI_DEMANDE`, la ligne reçue (voir `demande.rs`), qui
+//! dit la plage, le départ et les programmes. Il ne reste alors à régler que `ESSAI_VOIES`, une
+//! seule voie, et au besoin `ESSAI_FILS` : l'ordre est séquentiel, rien n'est écrit hors de la
+//! voie, et les autres saisies doivent rester vides. Une demande refusée reçoit pour tout flux
+//! l'événement `refus`, avec son motif, et le programme rend le code 2.
+//!
 //! Deux valeurs sont lues à la compilation et redites par l'événement `debut` : `ESSAI_ATELIER`,
 //! le commit de l'atelier dont le programme est construit, et `ESSAI_OUTIL`, celui de l'outil.
 //!
@@ -62,7 +68,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
-    os::fd::FromRawFd,
+    os::{fd::FromRawFd, unix::ffi::OsStrExt},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -78,6 +84,7 @@ use jetstreamer::{
     plugin::{FirehoseErrorContext, Plugin, PluginFuture},
 };
 
+mod demande;
 mod flux;
 mod outils;
 mod suivi;
@@ -85,6 +92,21 @@ mod suivi;
 /// Slots lus avant la plage sans rien en rendre, quand le départ n'est pas donné : leurs blocs
 /// disent le hash du parent du premier bloc de la plage.
 const MARGE: u64 = 64;
+
+/// Slots d'une tranche, quand leur nombre n'est pas donné.
+const TRANCHE: u64 = 100;
+
+/// Les saisies de l'épreuve que la ligne d'une demande remplace, ou qui n'ont pas de sens pour
+/// elle : avec `ESSAI_DEMANDE`, elles doivent rester vides.
+const HORS_SERVICE: [&str; 7] = [
+    "ESSAI_PLAGE",
+    "ESSAI_PROGRAMMES",
+    "ESSAI_ORDRE",
+    "ESSAI_AVANT",
+    "ESSAI_TRANCHE",
+    "ESSAI_A_PART",
+    "ESSAI_SORTIE",
+];
 
 /// Le commit de l'atelier dont ce programme est construit, et celui de l'outil : donnés à la
 /// compilation, vides sinon.
@@ -553,20 +575,32 @@ fn ouvrir_voie(texte: &str) -> Result<File, Box<dyn std::error::Error>> {
     Ok(fichier)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let saisie = |nom: &str| std::env::var(nom).unwrap_or_default();
+/// Ce qu'il est demandé de lire : par l'environnement pour l'épreuve, par la ligne d'une
+/// demande pour le service.
+struct Saisies {
+    plage: (u64, u64),
+    programmes: String,
+    suivis: Vec<[u8; 32]>,
+    avant: u64,
+    sequentiel: bool,
+    tranche: u64,
+    a_part: Vec<(u64, u64)>,
+    sortie: Option<PathBuf>,
+}
+
+/// Les saisies de l'épreuve, lues dans l'environnement.
+fn saisies_de_l_epreuve(saisie: impl Fn(&str) -> String) -> Result<Saisies, &'static str> {
     let plage =
         outils::plage(&saisie("ESSAI_PLAGE")).ok_or("ESSAI_PLAGE : attendu « début:fin »")?;
     let programmes = saisie("ESSAI_PROGRAMMES");
     let suivis = outils::adresses(&programmes).ok_or("ESSAI_PROGRAMMES : adresses illisibles")?;
-    let fils = saisie("ESSAI_FILS");
     let sequentiel = match saisie("ESSAI_ORDRE").trim() {
         "" | "parallele" => false,
         "sequentiel" => true,
-        _ => return Err("ESSAI_ORDRE : « parallele » ou « sequentiel » attendu".into()),
+        _ => return Err("ESSAI_ORDRE : « parallele » ou « sequentiel » attendu"),
     };
     let tranche = match saisie("ESSAI_TRANCHE").trim() {
-        "" => 100,
+        "" => TRANCHE,
         texte => texte
             .parse::<u64>()
             .ok()
@@ -580,7 +614,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chemin => Some(PathBuf::from(chemin)),
     };
     if sortie.is_none() && !a_part.is_empty() {
-        return Err("ESSAI_A_PART : il faut alors ESSAI_SORTIE, le répertoire des résultats".into());
+        return Err("ESSAI_A_PART : il faut alors ESSAI_SORTIE, le répertoire des résultats");
     }
     let avant = match saisie("ESSAI_AVANT").trim() {
         "" => plage.0.saturating_sub(MARGE),
@@ -590,20 +624,101 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|avant| *avant < plage.0)
             .ok_or("ESSAI_AVANT : slot attendu, avant la plage")?,
     };
-    let chemins = saisie("ESSAI_VOIES");
+    Ok(Saisies {
+        plage,
+        programmes,
+        suivis,
+        avant,
+        sequentiel,
+        tranche,
+        a_part,
+        sortie,
+    })
+}
+
+/// Ouvre les voies que disent `ESSAI_VOIES`.
+fn ouvrir_voies(chemins: &str) -> Result<Vec<File>, Box<dyn std::error::Error>> {
     if chemins.trim().is_empty() {
         return Err("ESSAI_VOIES : au moins une voie attendue".into());
     }
-    let mut voies = Vec::new();
-    for chemin in chemins.split(',') {
-        let fichier = ouvrir_voie(chemin.trim())?;
-        voies.push(Voie {
+    chemins
+        .split(',')
+        .map(|chemin| ouvrir_voie(chemin.trim()))
+        .collect()
+}
+
+/// Refuse la demande : pour tout flux, l'événement `refus` et son motif ; code 2.
+fn refuser(voie: File, motif: &str) -> ! {
+    eprintln!("essai : demande refusée : {motif}");
+    let mut sortie = BufWriter::new(voie);
+    let dit = format!("{{\"e\":\"refus\",\"motif\":{}}}", outils::chaine(motif));
+    if let Err(erreur) = flux::ecrire_evenement(&mut sortie, &dit).and_then(|()| sortie.flush()) {
+        abandonner("voie", &erreur);
+    }
+    std::process::exit(2)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let saisie = |nom: &str| std::env::var(nom).unwrap_or_default();
+    let chemins = saisie("ESSAI_VOIES");
+    let (saisies, fichiers) = match std::env::var_os("ESSAI_DEMANDE") {
+        None => {
+            let saisies = saisies_de_l_epreuve(saisie)?;
+            (saisies, ouvrir_voies(&chemins)?)
+        }
+        // Une demande à servir. Ce qui cloche dans les réglages est l'affaire de la machine, pas
+        // de qui demande : cela se dit avant de lire la ligne, et hors du flux.
+        Some(ligne) => {
+            let donnee = |nom: &str| std::env::var_os(nom).is_some_and(|dit| !dit.is_empty());
+            if let Some(nom) = HORS_SERVICE.iter().find(|nom| donnee(nom)) {
+                let motif = format!("{nom} : doit rester vide quand ESSAI_DEMANDE est donnée");
+                return Err(motif.into());
+            }
+            if chemins.contains(',') {
+                return Err("ESSAI_VOIES : une seule voie quand ESSAI_DEMANDE est donnée".into());
+            }
+            let mut fichiers = ouvrir_voies(&chemins)?;
+            match demande::comprendre(ligne.as_bytes()) {
+                Ok(demande) => {
+                    // Une ligne comprise n'a que des adresses qui se lisent.
+                    let suivis = outils::adresses(&demande.programmes)
+                        .ok_or("ESSAI_DEMANDE : programmes illisibles")?;
+                    let saisies = Saisies {
+                        plage: demande.plage,
+                        programmes: demande.programmes,
+                        suivis,
+                        avant: demande.avant,
+                        sequentiel: true,
+                        tranche: TRANCHE,
+                        a_part: Vec::new(),
+                        sortie: None,
+                    };
+                    (saisies, fichiers)
+                }
+                Err(motif) => refuser(fichiers.remove(0), &motif),
+            }
+        }
+    };
+    let Saisies {
+        plage,
+        programmes,
+        suivis,
+        avant,
+        sequentiel,
+        tranche,
+        a_part,
+        sortie,
+    } = saisies;
+    let fils = saisie("ESSAI_FILS");
+    let voies: Vec<Voie> = fichiers
+        .into_iter()
+        .map(|fichier| Voie {
             sortie: Mutex::new(BufWriter::with_capacity(1 << 20, fichier)),
             transactions: AtomicU64::new(0),
             blocs: AtomicU64::new(0),
             sans_bloc: AtomicU64::new(0),
-        });
-    }
+        })
+        .collect();
     let part = match &sortie {
         Some(sortie) => {
             std::fs::create_dir_all(sortie)?;
