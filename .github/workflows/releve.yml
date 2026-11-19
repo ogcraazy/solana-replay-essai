@@ -2,8 +2,9 @@ name: Relevé de l'archive
 
 # Ce que pèse l'archive publique Old Faithful, époque par époque : la taille et la date de
 # chaque fichier, par des requêtes d'en-tête seulement (rien n'est téléchargé), et, pour une
-# plage de slots, le nombre d'octets à lire d'après l'index de son époque. Lancé à la main ;
-# aucun secret ; le résultat est déposé sur la branche « resultats ».
+# plage de slots, le nombre d'octets à lire d'après l'index de son époque — et, sur demande,
+# cet index lui-même, compressé, avec son empreinte. Lancé à la main ; aucun secret ; le
+# résultat est déposé sur la branche « resultats ».
 
 on:
   workflow_dispatch:
@@ -13,6 +14,9 @@ on:
         required: true
       plage:
         description: Plage de slots dont compter les octets d'après l'index, « début:fin » (peut rester vide)
+        default: ""
+      index:
+        description: « garder » dépose aussi l'index de chaque époque de la plage (deux époques au plus) ; vide sinon
         default: ""
 
 permissions:
@@ -40,6 +44,7 @@ jobs:
         env:
           EPOQUES: ${{ inputs.epoques }}
           PLAGE: ${{ inputs.plage }}
+          INDEX: ${{ inputs.index }}
         run: |
           refuse() { echo "::error::saisie refusée : $1"; exit 2; }
           [[ "$EPOQUES" =~ ^[0-9]{1,5}-[0-9]{1,5}$ ]] || refuse "époques, attendu « première-dernière »"
@@ -51,11 +56,17 @@ jobs:
             debut=$((10#${PLAGE%%:*})); fin=$((10#${PLAGE##*:}))
             (( debut <= fin && fin / 432000 - debut / 432000 < 8 )) || refuse "plage à l'envers, ou sur plus de huit époques"
           fi
+          [[ -z "$INDEX" || "$INDEX" == garder ]] || refuse "index, attendu « garder » ou rien"
+          if [[ "$INDEX" == garder ]]; then
+            [[ -n "$PLAGE" ]] || refuse "garder l'index demande une plage"
+            (( fin / 432000 - debut / 432000 < 2 )) || refuse "garder l'index, sur deux époques au plus"
+          fi
           {
             echo "PREMIERE=$premiere"
             echo "DERNIERE=$derniere"
             echo "PLAGE_DEBUT=$debut"
             echo "PLAGE_FIN=$fin"
+            echo "GARDER_INDEX=$INDEX"
             echo "RELEVE=$RUNNER_TEMP/releve"
           } >> "$GITHUB_ENV"
       - name: Tailles et dates
@@ -76,13 +87,27 @@ jobs:
       - name: Octets de la plage
         if: env.PLAGE_DEBUT != ''
         run: |
+          if [[ "$GARDER_INDEX" == garder ]] && ! command -v zstd > /dev/null; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
           for epoque in $(seq "$((PLAGE_DEBUT / 432000))" "$((PLAGE_FIN / 432000))"); do
             curl --silent --show-error --fail --location --max-time 120 \
               --output "$RUNNER_TEMP/index-$epoque.raw" "$ARCHIVE/$epoque/epoch-$epoque-slot-ranges.raw"
             python3 releve/octets.py "$RUNNER_TEMP/index-$epoque.raw" "$epoque" >> "$RELEVE/plage.jsonl"
             python3 releve/octets.py "$RUNNER_TEMP/index-$epoque.raw" "$epoque" "$PLAGE_DEBUT" "$PLAGE_FIN" >> "$RELEVE/plage.jsonl"
+            # L'index est une donnée publique de l'archive : gardé tel quel, sous le nom que
+            # l'archive lui donne, avec l'empreinte de ses octets avant compression.
+            if [[ "$GARDER_INDEX" == garder ]]; then
+              nom="epoch-$epoque-slot-ranges.raw"
+              echo "$(sha256sum < "$RUNNER_TEMP/index-$epoque.raw" | cut -d' ' -f1)  $nom" >> "$RELEVE/index.sha256"
+              zstd --quiet -19 --stdout "$RUNNER_TEMP/index-$epoque.raw" > "$RELEVE/$nom.zst"
+            fi
           done
           cat "$RELEVE/plage.jsonl"
+          if [[ "$GARDER_INDEX" == garder ]]; then
+            cat "$RELEVE/index.sha256"
+            ls -l "$RELEVE"
+          fi
       - name: Pièce jointe
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
