@@ -41,6 +41,12 @@
 //! égal ou plus haut, et les transactions gardées arrivées après l'en-tête de leur slot ou
 //! d'un slot plus haut. Avec plusieurs fils, ces comptes sont grands, et c'est attendu ; en
 //! ordre séquentiel ils devraient être nuls, et le résumé dit s'ils le sont.
+//!
+//! Les blocs incomplets. Le greffon retient, pour chaque bloc en cours, les rangs des
+//! transactions que l'outil lui passe — toutes, avant tout tri — et les confronte, à l'en-tête,
+//! au nombre que le bloc dit avoir exécuté (voir `suivi.rs`). Le résumé et l'événement `fin` de
+//! chaque voie disent combien de blocs de toute la lecture n'ont pas reçu toutes leurs
+//! transactions, ou n'ont pas reçu leur en-tête, et combien de fois la lecture a repris.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -63,6 +69,7 @@ use jetstreamer::{
 
 mod flux;
 mod outils;
+mod suivi;
 
 /// Slots lus avant la plage sans rien en rendre : leurs blocs disent le hash du parent du
 /// premier bloc de la plage.
@@ -122,6 +129,8 @@ struct Essai {
     retards: AtomicU64,
     /// Le premier et le dernier bloc daté : (slot, heure).
     heures: Mutex<Option<((u64, i64), (u64, i64))>>,
+    /// Les blocs en cours : ce que l'outil a rendu de chacun.
+    suivi: suivi::Suivi,
 }
 
 /// Le greffon lui-même : l'outil le garde, l'essai reste lisible après la lecture.
@@ -222,6 +231,8 @@ impl Essai {
             }
         }
         let lu = |compte: &AtomicU64| compte.load(Ordering::Relaxed);
+        let reprises = lu(&self.reprises);
+        let incomplets = self.suivi.incomplets();
         let mut par_voie = Vec::with_capacity(self.voies.len());
         for (rang, voie) in self.voies.iter().enumerate() {
             let comptes = format!(
@@ -233,7 +244,7 @@ impl Essai {
             self.evenement(
                 voie,
                 &format!(
-                    "{{\"e\":\"fin\",\"voie\":{rang},{comptes},\"lecture_sans_erreur\":{sans_erreur}}}"
+                    "{{\"e\":\"fin\",\"voie\":{rang},{comptes},\"reprises\":{reprises},\"blocs_incomplets\":{incomplets},\"lecture_sans_erreur\":{sans_erreur}}}"
                 ),
             );
             voie.sortie.lock().expect("voie").flush()?;
@@ -276,7 +287,8 @@ impl Essai {
                 "\"dernier_bloc\":{}",
                 borne(heures.map(|(_, dernier)| dernier))
             ),
-            format!("\"reprises\":{}", lu(&self.reprises)),
+            format!("\"reprises\":{reprises}"),
+            format!("\"blocs_incomplets\":{incomplets}"),
             format!("\"marge_de_lecture\":{MARGE}"),
             format!("\"avant_la_plage\":{}", lu(&self.avant)),
             format!("\"parents_differes\":{}", lu(&self.differes)),
@@ -311,6 +323,9 @@ impl Plugin for Greffon {
                 return Ok(());
             }
             essai.vues.fetch_add(1, Ordering::Relaxed);
+            essai
+                .suivi
+                .vue(transaction.slot, transaction.transaction_slot_index as u64);
             if transaction.is_vote {
                 essai.votes.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
@@ -399,6 +414,7 @@ impl Plugin for Greffon {
                     essai
                         .executees
                         .fetch_add(*executed_transaction_count, Ordering::Relaxed);
+                    essai.suivi.bloc(*slot, *executed_transaction_count);
                     if let Some(heure) = block_time {
                         let vu = (*slot, *heure);
                         let mut heures = essai.heures.lock().expect("heures des blocs");
@@ -542,6 +558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reculs: AtomicU64::new(0),
         retards: AtomicU64::new(0),
         heures: Mutex::new(None),
+        suivi: suivi::Suivi::new(),
     });
     for (rang, voie) in essai.voies.iter().enumerate() {
         essai.evenement(
