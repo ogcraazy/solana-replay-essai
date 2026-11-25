@@ -1,0 +1,8 @@
+contrôle — demande refusée : CONFORME — un seul événement, « refus : version inconnue : ce lecteur ne sert que « v1 » »
+contrôle — ligne trop longue : CONFORME — un seul événement, « refus : ligne de plus de 1024 octets »
+contrôle — ligne qui ne vient pas : CONFORME — connexion close après 10 s, 0 octet(s) reçu(s)
+contrôle — client parti au milieu du flux : CONFORME — 1000000 octets pris, puis 0 processus restant(s)
+contrôle — connexion de trop : CONFORME — fermée après 0 s, 0 octet(s) reçu(s)
+contrôle — la connexion en cours n'est pas troublée : CONFORME — tenue 10 s, 0 octet(s) reçu(s)
+contrôle — après elles, le lecteur répond : CONFORME — un seul événement, « refus : version inconnue : ce lecteur ne sert que « v1 » »
+contrôles en échec : 0
