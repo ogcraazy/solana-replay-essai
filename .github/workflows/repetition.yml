@@ -1,0 +1,214 @@
+name: Répétition d'une location
+
+# La répétition générale d'une machine louée : le script d'initialisation du dossier
+# « lecteur » (location.sh) est rempli et lancé sur la machine de l'exécution comme il le
+# serait au premier démarrage d'une machine neuve — il prend l'atelier au commit qu'il fixe,
+# compile le programme de lecture, l'installe et ferme le pare-feu. Puis le journal de
+# l'amorce est relu par son port, le lecteur reçoit une vraie demande, et ses garde-fous sont
+# contrôlés un à un. L'adresse de la machine tient lieu de client.
+#
+# Elle ne se lance qu'à la main et ne lit aucun secret ; ses résultats sont déposés sur la
+# branche « resultats » de ce dépôt. Ce qu'elle ne montre pas : le tri que fait le pare-feu
+# entre deux machines, puisqu'il n'y en a qu'une.
+
+on:
+  workflow_dispatch:
+    inputs:
+      plage:
+        description: Plage de slots de la demande, « début:fin », bornes comprises (2 000 slots au plus)
+        required: true
+      programmes:
+        description: Adresses des programmes à garder, en base 58, séparées par des virgules
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repetition
+  cancel-in-progress: false
+
+env:
+  ARCHIVE: https://files.old-faithful.net
+  PORT: "7411"
+  PORT_JOURNAL: "7412"
+  PROGRAMME: /usr/local/lib/lecteur/essai
+  CONSTRUIT: /var/lib/constructeur/outil/target/release/examples/essai
+
+jobs:
+  repetition:
+    name: Répéter une location
+    # Le système que le script d'initialisation attend.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - name: Atelier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Rien de ce qui est saisi n'entre dans le texte de ce qui s'exécute : tout passe par
+      # l'environnement et est contrôlé avant de servir.
+      - name: Saisies
+        env:
+          PLAGE: ${{ inputs.plage }}
+          PROGRAMMES: ${{ inputs.programmes }}
+        run: |
+          refuse() { echo "::error::saisie refusée : $1"; exit 2; }
+          [[ "$PLAGE" =~ ^[0-9]{1,12}:[0-9]{1,12}$ ]] || refuse "plage, attendu « début:fin »"
+          debut="${PLAGE%%:*}"; fin="${PLAGE##*:}"
+          (( 10#$debut <= 10#$fin )) || refuse "plage à l'envers"
+          (( 10#$fin - 10#$debut < 2000 )) || refuse "plage de 2 000 slots au plus"
+          [[ "$PROGRAMMES" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}(,[1-9A-HJ-NP-Za-km-z]{32,44}){0,7}$ ]] \
+            || refuse "programmes, attendu des adresses en base 58 séparées par des virgules"
+          {
+            echo "REP_PLAGE=$((10#$debut)):$((10#$fin))"
+            echo "REP_PROGRAMMES=$PROGRAMMES"
+            echo "REP_SORTIE=$RUNNER_TEMP/resultat"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/resultat"
+      - name: Essais du script d'initialisation
+        run: bash lecteur/essais_location.sh
+      - name: Machine
+        run: |
+          echo "$(nproc) processeurs ; mémoire : $(free -m | awk '/^Mem:/ { print $2 }') Mo"
+          df -h / | tail -n 1
+          ip -4 -o addr show
+          sudo ufw status || true
+      # Le script est rempli comme il le serait à la main : la quatrième ligne reçoit l'adresse
+      # du client — ici celle de la machine même, dont les demandes passent par sa boucle
+      # locale. Ce qu'il dit va dans son journal, relu plus bas par son port.
+      - name: Script d'initialisation, lancé comme au premier démarrage
+        run: |
+          adresse=$(ip -4 -o route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+          [[ -n "$adresse" ]] || { echo "::error::adresse de la machine introuvable"; exit 1; }
+          echo "ADRESSE=$adresse" >> "$GITHUB_ENV"
+          sed "4s/.*/CLIENT=\"$adresse\"/" lecteur/location.sh > "$RUNNER_TEMP/location.sh"
+          sed -n 4p "$RUNNER_TEMP/location.sh"
+          depart=$SECONDS; code=0
+          sudo bash "$RUNNER_TEMP/location.sh" > "$RUNNER_TEMP/dit.txt" 2>&1 || code=$?
+          echo "script : code $code, $((SECONDS - depart)) s"
+          grep -a '^\[location ' "$RUNNER_TEMP/dit.txt" || true
+          (( code == 0 )) || { tail -n 40 "$RUNNER_TEMP/dit.txt"; exit "$code"; }
+      # Le journal, tel qu'un client le lirait : une connexion, et la fin du fichier. Lu même
+      # après un échec du script : c'est à cela qu'il sert.
+      - name: Journal de l'amorce, lu par son port
+        if: always() && env.ADRESSE != ''
+        run: |
+          timeout 30 bash -c 'cat < "/dev/tcp/$0/$1"' "$ADRESSE" "$PORT_JOURNAL" \
+            > "$REP_SORTIE/journal-amorce.txt" || true
+          echo "octets lus : $(wc -c < "$REP_SORTIE/journal-amorce.txt")"
+          grep -a '^\[location ' "$REP_SORTIE/journal-amorce.txt" || true
+          tail -n 3 "$REP_SORTIE/journal-amorce.txt"
+          grep -aq 'terminé : le lecteur écoute' "$REP_SORTIE/journal-amorce.txt"
+      - name: Pare-feu et unités
+        if: always() && env.ADRESSE != ''
+        run: |
+          sudo ufw status verbose | tee "$REP_SORTIE/pare-feu.txt"
+          systemctl --no-pager --full status lecteur.socket amorce-journal.socket \
+            | grep -E '●|Loaded|Active|Listen|Accepted' || true
+          dit() { if grep -Eq "$2" "$REP_SORTIE/pare-feu.txt"; then echo "pare-feu — $1 : CONFORME"; else echo "::warning::pare-feu — $1 : À LIRE"; fi; }
+          dit "rien n'entre par défaut" 'Default: deny \(incoming\), allow \(outgoing\)'
+          dit "le client est admis au lecteur" "^$ADRESSE $PORT/tcp +ALLOW IN +$ADRESSE"
+          dit "le client est admis au journal" "^$ADRESSE $PORT_JOURNAL/tcp +ALLOW IN +$ADRESSE"
+          echo "règles : $(grep -c 'ALLOW IN' "$REP_SORTIE/pare-feu.txt") (deux attendues)"
+      # D'où partir : le dernier slot à bloc d'avant la plage, lu dans l'index de l'archive —
+      # celui de l'époque de la plage, ou de la précédente quand la plage ouvre son époque.
+      - name: Départ de la lecture
+        run: |
+          debut="${REP_PLAGE%%:*}"
+          epoque=$((debut / 432000))
+          prendre() {
+            curl --silent --show-error --fail --location --max-time 120 \
+              --output "$RUNNER_TEMP/index-$1.raw" "$ARCHIVE/$1/epoch-$1-slot-ranges.raw"
+          }
+          prendre "$epoque"
+          depart=$(python3 releve/octets.py "$RUNNER_TEMP/index-$epoque.raw" "$epoque" avant "$debut")
+          if [[ "$depart" == - ]]; then
+            prendre "$((epoque - 1))"
+            depart=$(python3 releve/octets.py "$RUNNER_TEMP/index-$((epoque - 1)).raw" \
+              "$((epoque - 1))" avant "$((epoque * 432000))")
+          fi
+          [[ "$depart" =~ ^[0-9]+$ ]] \
+            || { echo "::error::aucun bloc avant la plage, ni dans son époque ni dans la précédente"; exit 1; }
+          echo "départ de la lecture : slot $depart, $((debut - depart)) slot(s) avant la plage"
+          echo "DEPART=$depart" >> "$GITHUB_ENV"
+      # Une vraie demande, par l'adresse de la machine : une ligne, puis le flux jusqu'à ce que
+      # le lecteur ferme la connexion. Le flux n'est pas gardé : seul son poids est dit.
+      - name: Demande
+        run: |
+          depart=$SECONDS; code=0
+          timeout --signal=TERM --kill-after=30 15m \
+            bash lecteur/demander.sh "$ADRESSE" "$PORT" "v1 $REP_PLAGE $DEPART $REP_PROGRAMMES" \
+            > "$RUNNER_TEMP/flux" || code=$?
+          octets=$(wc -c < "$RUNNER_TEMP/flux")
+          echo "demande : code $code, $octets octets de flux, $((SECONDS - depart)) s" \
+            | tee "$REP_SORTIE/demande.txt"
+          (( code == 0 && octets > 1000000 ))
+      # Les garde-fous du lecteur, un à un ; puis, le lecteur réinstallé pour une seule demande
+      # à la fois, une connexion de trop.
+      - name: Contrôles du lecteur
+        run: |
+          echecs=0
+          bash lecteur/controles.sh "$ADRESSE" "$PORT" "$PROGRAMME" \
+            "v1 $REP_PLAGE $DEPART $REP_PROGRAMMES" | tee "$REP_SORTIE/controles.txt" \
+            || echecs=$((echecs + PIPESTATUS[0]))
+          sudo bash lecteur/installer.sh "$CONSTRUIT" "$ADRESSE" "$PORT" 1
+          bash lecteur/controles.sh "$ADRESSE" "$PORT" "$PROGRAMME" borne \
+            | tee -a "$REP_SORTIE/controles.txt" || echecs=$((echecs + PIPESTATUS[0]))
+          echo "contrôles en échec : $echecs" | tee -a "$REP_SORTIE/controles.txt"
+          (( echecs == 0 ))
+      - name: Journal du lecteur
+        if: always()
+        run: |
+          sudo journalctl --no-pager --output=short-iso -u lecteur.socket -u 'lecteur@*' \
+            -u amorce-journal.socket -u 'amorce-journal@*' > "$REP_SORTIE/journal-lecteur.txt" || true
+          echo "lignes du journal : $(wc -l < "$REP_SORTIE/journal-lecteur.txt")"
+          grep -E 'systemd\[|servir : |essai : ' "$REP_SORTIE/journal-lecteur.txt" | tail -n 40 || true
+          [[ ! -s "$REP_SORTIE/journal-lecteur.txt" ]] || gzip -9 "$REP_SORTIE/journal-lecteur.txt"
+          [[ ! -s "$REP_SORTIE/journal-amorce.txt" ]] || gzip -9 "$REP_SORTIE/journal-amorce.txt"
+          ls -l "$REP_SORTIE"
+      - name: Pièce jointe
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: repetition
+          path: ${{ runner.temp }}/resultat
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Cette tâche dépose les résultats sur la branche « resultats » du dépôt ; elle seule a le
+  # droit d'y écrire, et elle n'exécute aucun code venu d'ailleurs.
+  rendre:
+    name: Déposer les résultats
+    needs: repetition
+    if: always() && needs.repetition.result != 'cancelled' && needs.repetition.result != 'skipped'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Dépôt
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Résultats de la répétition
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: repetition
+          path: ${{ runner.temp }}/resultat
+      - name: Branche des résultats
+        env:
+          EXECUTION: ${{ github.run_id }}
+        run: |
+          if git fetch --quiet --depth 1 origin resultats; then
+            git checkout --quiet -B resultats FETCH_HEAD
+          else
+            git checkout --quiet --orphan resultats
+            git rm -r --quiet --force .
+          fi
+          mkdir -p "repetitions/$EXECUTION"
+          cp "$RUNNER_TEMP"/resultat/* "repetitions/$EXECUTION/"
+          git add repetitions
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet --message "Résultats de la répétition $EXECUTION"
+          git push --quiet origin resultats
+          ls -l "repetitions/$EXECUTION"
