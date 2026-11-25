@@ -187,7 +187,11 @@ git -C "$SOURCES" checkout --quiet --detach FETCH_HEAD
   || echec "les sources prises ne sont pas au commit fixé."
 
 dire "4/4 l'amorce du lecteur"
-bash "$SOURCES/lecteur/amorce.sh" "$COMMIT" "$adresse" "$client"
+# D'un environnement vide : l'amorce compile sous un utilisateur sans droits, qui hériterait
+# sinon de variables nommant des dossiers qu'il ne peut pas lire.
+env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  DEBIAN_FRONTEND=noninteractive \
+  bash "$SOURCES/lecteur/amorce.sh" "$COMMIT" "$adresse" "$client"
 # L'amorce a fermé le pare-feu au seul port du lecteur : le journal s'y ajoute.
 ufw allow proto tcp from "$client" to "$adresse" port "$PORT_JOURNAL"
 

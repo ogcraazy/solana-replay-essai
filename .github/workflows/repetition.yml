@@ -74,6 +74,16 @@ jobs:
           df -h / | tail -n 1
           ip -4 -o addr show
           sudo ufw status || true
+      # Ce qu'un utilisateur sans droits reçoit de l'environnement de cette machine, par le
+      # chemin que prend l'amorce (administrateur, puis utilisateur sans droits) : tel quel,
+      # puis depuis un environnement vide, comme le script d'initialisation le fait.
+      - name: Environnement hérité par un utilisateur sans droits
+        run: |
+          voir='env | grep -E "^(XDG_|GIT_)" || echo "aucune variable XDG_ ni GIT_"; d=$(mktemp -d); git init --quiet "$d"; git -C "$d" status --porcelain; echo "git : code $?"'
+          echo "— tel quel :"
+          sudo runuser -u nobody -- env HOME=/tmp bash -c "$voir" 2>&1 || true
+          echo "— depuis un environnement vide :"
+          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin runuser -u nobody -- env HOME=/tmp bash -c "$voir" 2>&1 || true
       # Le script est rempli comme il le serait à la main : la quatrième ligne reçoit l'adresse
       # du client — ici celle de la machine même, dont les demandes passent par sa boucle
       # locale. Ce qu'il dit va dans son journal, relu plus bas par son port.

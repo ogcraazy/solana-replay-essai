@@ -88,6 +88,10 @@ egal "la ligne à remplir est la quatrième" 'CLIENT="COLLE_ICI_L_ADRESSE_PRIVEE
 egal "le texte à remplacer n'y est qu'une fois" 1 "$(grep -c 'COLLE_ICI' "$script")"
 egal "aucune commande n'est tracée" 0 "$(grep -c 'set -x' "$script")"
 egal "le commit fixé est entier" 1 "$(grep -Ec '^COMMIT="[0-9a-f]{40}"$' "$script")"
+# L'amorce compile sous un utilisateur sans droits, qui hérite de l'environnement : une
+# variable qui nomme un dossier d'un autre compte y fait échouer la compilation.
+egal "l'amorce part d'un environnement vide" 1 \
+  "$(grep -c '^env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\$' "$script")"
 egal "le script se lit" 0 "$(bash -n "$script" > /dev/null 2>&1; echo $?)"
 
 # Le script lancé pour de bon, mais sans droits : il s'arrête avant de rien faire. En
